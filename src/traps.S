@@ -112,6 +112,24 @@ EXCEPTION 29, 1
 EXCEPTION 30, 1
 EXCEPTION 31
 
+# Legacy PIC IRQ0..15, remapped clear of the CPU exception vectors.
+EXCEPTION 32
+EXCEPTION 33
+EXCEPTION 34
+EXCEPTION 35
+EXCEPTION 36
+EXCEPTION 37
+EXCEPTION 38
+EXCEPTION 39
+EXCEPTION 40
+EXCEPTION 41
+EXCEPTION 42
+EXCEPTION 43
+EXCEPTION 44
+EXCEPTION 45
+EXCEPTION 46
+EXCEPTION 47
+
 .global arch_int80
 .type arch_int80,@function
 arch_int80:
@@ -157,6 +175,15 @@ arch_trap_common:
     mov es, ax
     mov ss, ax
 
+    mov rax, [rsp + 120]
+    cmp eax, 32
+    je .Ltimer_irq
+    cmp eax, 33
+    jb .Ldeliver_context
+    cmp eax, 47
+    jbe .Lother_irq
+
+.Ldeliver_context:
     mov rax, [rsp + 144]            # Saved CS.
     and eax, 3
     cmp eax, 3
@@ -181,7 +208,82 @@ arch_trap_common:
     pop rbp
     ret
 
+.Ltimer_irq:
+    # Acknowledge only master IRQ0 with a specific EOI. The locked increment
+    # matches the AtomicU64 reader in timer.rs, including on a future SMP CPU.
+    lock inc qword ptr [rip + TIMER_TICKS]
+    mov al, 0x60
+    out 0x20, al
+    test byte ptr [rsp + 144], 3
+    jnz .Ldeliver_context
+    # IF is normally zero in ring 0. If an IRQ nevertheless interrupted it,
+    # resume that exact frame; never abandon a kernel operation mid-flight.
+    jmp .Lreturn_interrupt
+
+.Lother_irq:
+    # All other PIC inputs are masked. If a pending or spurious interrupt
+    # survives initialization, acknowledge it correctly and resume directly.
+    cmp eax, 39
+    je .Lmaster_irq7
+    cmp eax, 47
+    je .Lslave_irq15
+    cmp eax, 40
+    jae .Lack_slave_irq
+    and al, 7
+    or al, 0x60
+    out 0x20, al
+    jmp .Lreturn_interrupt
+.Lmaster_irq7:
+    mov al, 0x0b                  # OCW3: read in-service register.
+    out 0x20, al
+    in al, 0x20
+    test al, 0x80
+    jz .Lreturn_interrupt        # Spurious IRQ7 has no ISR bit to clear.
+    mov al, 0x67
+    out 0x20, al
+    jmp .Lreturn_interrupt
+.Lslave_irq15:
+    mov al, 0x0b
+    out 0xa0, al
+    in al, 0xa0
+    test al, 0x80
+    jz .Lack_cascade             # Spurious IRQ15 still needs master EOI.
+    mov al, 0x67
+    out 0xa0, al
+    jmp .Lack_cascade
+.Lack_slave_irq:
+    and al, 7
+    or al, 0x60
+    out 0xa0, al
+.Lack_cascade:
+    mov al, 0x62                 # Master IRQ2 is the slave cascade.
+    out 0x20, al
+    jmp .Lreturn_interrupt
+
 .Lkernel_fault:
+.if {test_probes}
+    # Only the explicit test probes may recover from a supervisor page fault.
+    # Match both the exact expected instruction and CR2; never swallow an
+    # unrelated exception or a user fault at a superficially similar address.
+    cmp qword ptr [rsp + 120], 14
+    jne .Lfatal_kernel_fault
+    mov rax, [rip + arch_probe_rip]
+    test rax, rax
+    jz .Lfatal_kernel_fault
+    cmp rax, [rsp + 136]
+    jne .Lfatal_kernel_fault
+    mov rax, cr2
+    cmp rax, [rip + arch_probe_address]
+    jne .Lfatal_kernel_fault
+    mov rax, [rip + arch_probe_fixup]
+    mov [rsp + 136], rax
+    mov rax, [rsp + 128]
+    mov [rsp + 112], rax         # Probe returns the page-fault error code.
+    mov qword ptr [rip + arch_probe_rip], 0
+    jmp .Lreturn_interrupt
+.endif
+
+.Lfatal_kernel_fault:
     mov rdi, [rsp + 120]
     mov rsi, [rsp + 128]
     mov rdx, [rsp + 136]
@@ -190,7 +292,72 @@ arch_trap_common:
     and rsp, -16
     call arch_kernel_fault
     ud2
+
+.Lreturn_interrupt:
+    test byte ptr [rsp + 144], 3
+    jz .Lrestore_registers
+    mov ax, 0x1b
+    mov ds, ax
+    mov es, ax
+.Lrestore_registers:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16                  # Normalized vector and error code.
+    iretq
 .size arch_trap_common, . - arch_trap_common
+
+.if {test_probes}
+.global arch_probe_write
+.type arch_probe_write,@function
+arch_probe_write:
+    # Read before enabling fixup: callers promise a readable target. Writing
+    # the same byte leaves text unchanged even if write protection is broken.
+    movzx eax, byte ptr [rdi]
+    mov [rip + arch_probe_address], rdi
+    lea r11, [rip + .Lwrite_fault_return]
+    mov [rip + arch_probe_fixup], r11
+    lea r11, [rip + .Lwrite_probe_instruction]
+    mov [rip + arch_probe_rip], r11
+.Lwrite_probe_instruction:
+    mov byte ptr [rdi], al
+    mov rax, -1
+.Lwrite_fault_return:
+    mov qword ptr [rip + arch_probe_rip], 0
+    ret
+.size arch_probe_write, . - arch_probe_write
+
+.global arch_probe_execute
+.type arch_probe_execute,@function
+arch_probe_execute:
+    # Call a known RET byte. On an NX fault, discard this extra return address
+    # in the fixup before returning to the original Rust caller.
+    mov [rip + arch_probe_address], rdi
+    lea r11, [rip + .Lexecute_fault_return]
+    mov [rip + arch_probe_fixup], r11
+    mov [rip + arch_probe_rip], rdi
+    mov rax, -1
+    call rdi
+    mov qword ptr [rip + arch_probe_rip], 0
+    ret
+.Lexecute_fault_return:
+    add rsp, 8
+    mov qword ptr [rip + arch_probe_rip], 0
+    ret
+.size arch_probe_execute, . - arch_probe_execute
+.endif
 
 .section .rodata.arch,"a",@progbits
 .balign 8
@@ -205,11 +372,26 @@ arch_exception_vectors:
     .quad arch_exception_24, arch_exception_25, arch_exception_26, arch_exception_27
     .quad arch_exception_28, arch_exception_29, arch_exception_30, arch_exception_31
 
+.global arch_irq_vectors
+arch_irq_vectors:
+    .quad arch_exception_32, arch_exception_33, arch_exception_34, arch_exception_35
+    .quad arch_exception_36, arch_exception_37, arch_exception_38, arch_exception_39
+    .quad arch_exception_40, arch_exception_41, arch_exception_42, arch_exception_43
+    .quad arch_exception_44, arch_exception_45, arch_exception_46, arch_exception_47
+
 .section .bss.arch,"aw",@nobits
 .balign 8
 arch_active_context:
     .skip 8
 arch_kernel_rsp:
     .skip 8
+.if {test_probes}
+arch_probe_rip:
+    .skip 8
+arch_probe_address:
+    .skip 8
+arch_probe_fixup:
+    .skip 8
+.endif
 
 .section .note.GNU-stack,"",@progbits

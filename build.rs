@@ -9,11 +9,26 @@ fn main() {
         "src/traps.S",
         "abi.rs",
         "userspace/main.rs",
+        "userspace/fuzz.rs",
         "userspace/syscall.rs",
         "userspace/http.rs",
         "userspace/linker.ld",
     ] {
         println!("cargo:rerun-if-changed={path}");
+    }
+    for (name, default, maximum) in [
+        ("KERNEL_FUZZ_SEED", 1u64, u64::MAX),
+        ("KERNEL_FUZZ_ITERATIONS", 100_000, 100_000_000),
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+        let value = env::var(name)
+            .map(|s| s.parse::<u64>().expect("numeric fuzz configuration"))
+            .unwrap_or(default);
+        assert!(
+            value > 0 && value <= maximum,
+            "fuzz configuration out of range"
+        );
+        println!("cargo:rustc-env={name}={value}");
     }
     // The boot-only test deliberately has no userspace dependency.
     if env::var_os("CARGO_FEATURE_SMOKE_TEST").is_some() {
@@ -44,7 +59,14 @@ fn main() {
         ))
         .arg("-o")
         .arg(output.join("webserver.elf"));
-    if env::var_os("CARGO_FEATURE_USERSPACE_TEST").is_some() {
+    if [
+        "CARGO_FEATURE_USERSPACE_TEST",
+        "CARGO_FEATURE_PREEMPTION_TEST",
+        "CARGO_FEATURE_FUZZ_TEST",
+    ]
+    .iter()
+    .any(|key| env::var_os(key).is_some())
+    {
         compiler.arg("--cfg=userspace_test");
     }
     assert!(

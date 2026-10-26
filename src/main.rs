@@ -5,10 +5,14 @@
 #[path = "../abi.rs"]
 mod abi;
 #[cfg(not(feature = "smoke-test"))]
+mod abuse;
+#[cfg(not(feature = "smoke-test"))]
 mod arch;
 mod console;
 #[cfg(not(feature = "smoke-test"))]
 mod e1000;
+#[cfg(not(feature = "smoke-test"))]
+mod memory;
 #[cfg(not(feature = "smoke-test"))]
 mod net;
 #[cfg(not(feature = "smoke-test"))]
@@ -17,7 +21,12 @@ mod pci;
 mod syscall;
 #[cfg(not(feature = "smoke-test"))]
 mod time;
-#[cfg(all(feature = "userspace-test", not(feature = "smoke-test")))]
+#[cfg(not(feature = "smoke-test"))]
+mod timer;
+#[cfg(all(
+    any(feature = "userspace-test", feature = "fuzz-test"),
+    not(feature = "smoke-test")
+))]
 mod user_test;
 #[cfg(not(feature = "smoke-test"))]
 mod userspace;
@@ -85,6 +94,14 @@ extern "C" fn kernel_main(magic: u32, info_addr: u32) -> ! {
     #[cfg(not(feature = "smoke-test"))]
     {
         arch::init();
+        let protection = memory::init();
+        memory::check_permissions();
+        writeln!(
+            console,
+            "Kernel pages: RX text, R/NX constants, RW/NX data; SMEP={} SMAP={}",
+            protection.smep, protection.smap
+        )
+        .ok();
         net::run(&mut console);
     }
 }
@@ -126,13 +143,25 @@ fn panic(info: &PanicInfo) -> ! {
     // again. Reinitializing here also makes early boot panics visible.
     let mut console = Console::new();
     writeln!(console, "KERNEL PANIC: {info}").ok();
-    #[cfg(any(feature = "smoke-test", feature = "userspace-test"))]
+    #[cfg(any(
+        feature = "smoke-test",
+        feature = "userspace-test",
+        feature = "fuzz-test"
+    ))]
     exit_qemu(0x11);
-    #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+    #[cfg(not(any(
+        feature = "smoke-test",
+        feature = "userspace-test",
+        feature = "fuzz-test"
+    )))]
     halt();
 }
 
-#[cfg(any(feature = "smoke-test", feature = "userspace-test"))]
+#[cfg(any(
+    feature = "smoke-test",
+    feature = "userspace-test",
+    feature = "fuzz-test"
+))]
 fn exit_qemu(code: u32) -> ! {
     // SAFETY: make test attaches QEMU's isa-debug-exit device at this port.
     // QEMU returns (code << 1) | 1 to the host, so success (0x10) becomes 33.

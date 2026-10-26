@@ -32,12 +32,14 @@ def main() -> int:
     parser.add_argument("kernel", type=Path, help="kernel binary to boot")
     parser.add_argument("--timeout", type=positive_timeout, default=15.0,
                         help="maximum boot time in seconds (default: 15)")
+    parser.add_argument("--cpu", default="qemu64", help="QEMU CPU model")
     args = parser.parse_args()
 
     command = [
         args.qemu,
         "-machine", "pc",
         "-accel", "tcg",
+        "-cpu", args.cpu,
         "-m", "128M",
         "-smp", "1",
         "-kernel", str(args.kernel),

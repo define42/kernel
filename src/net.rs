@@ -1,4 +1,4 @@
-//! Ethernet/ARP/IPv4/ICMP and TCP using smoltcp, without a heap or interrupts.
+//! Polled NIC/TCP with timer-preempted userspace and bounded syscall batches.
 
 use core::fmt::Write;
 
@@ -12,7 +12,7 @@ use crate::console::Console;
 use crate::e1000::{E1000, MAX_FRAME_SIZE};
 use crate::time::Clock;
 use crate::{abi, userspace::Process};
-#[cfg(not(feature = "userspace-test"))]
+#[cfg(not(any(feature = "userspace-test", feature = "fuzz-test")))]
 use crate::{arch, syscall};
 
 const FRAME_SIZE: usize = MAX_FRAME_SIZE; // Includes the 14-byte Ethernet header.
@@ -25,6 +25,27 @@ const USER_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/webserver.el
 struct EthernetDevice {
     nic: E1000,
     receive_buffer: [u8; FRAME_SIZE],
+    guard: crate::abuse::Guard,
+    pending_receive: Option<usize>,
+}
+
+impl EthernetDevice {
+    /// Preload one admitted frame before smoltcp borrows the socket set.
+    fn prepare(&mut self, timestamp: Instant) -> bool {
+        self.pending_receive = None;
+        if !self.nic.can_transmit() {
+            return false;
+        }
+        let Some(len) = self.nic.receive(&mut self.receive_buffer) else {
+            return false;
+        };
+        let frame = &self.receive_buffer[..len];
+        if !self.guard.allow(frame, timestamp.total_millis()) {
+            return false;
+        }
+        self.pending_receive = Some(len);
+        self.guard.matching_slot(frame).is_some()
+    }
 }
 
 struct ReceiveToken<'a>(&'a [u8]);
@@ -35,13 +56,9 @@ impl phy::Device for EthernetDevice {
     type TxToken<'a> = TransmitToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // Reserve capacity for a possible immediate ARP/ICMP/TCP response before
-        // taking ownership of an RX packet. Holding the token borrows the NIC
-        // exclusively, so nobody else can consume that TX slot in the meantime.
-        if !self.nic.can_transmit() {
-            return None;
-        }
-        let len = self.nic.receive(&mut self.receive_buffer)?;
+        // prepare() reserved a TX slot; no NIC operation occurs between
+        // preparing this frame and consuming it through poll_ingress_single.
+        let len = self.pending_receive.take()?;
         Some((
             ReceiveToken(&self.receive_buffer[..len]),
             TransmitToken(&mut self.nic),
@@ -97,6 +114,8 @@ pub fn run(console: &mut Console) -> ! {
             crate::halt();
         }
     };
+    crate::timer::init();
+    writeln!(console, "Timer: PIT 100 Hz; preemptive user scheduling").ok();
     let nic = match E1000::init(&clock) {
         Ok(nic) => nic,
         Err(error) => {
@@ -114,6 +133,8 @@ pub fn run(console: &mut Console) -> ! {
     let mut device = EthernetDevice {
         nic,
         receive_buffer: [0; FRAME_SIZE],
+        guard: crate::abuse::Guard::new(),
+        pending_receive: None,
     };
     let mut config = Config::new(mac.into());
     // Vary TCP sequence numbers across boots. This is a timing seed, not a
@@ -151,7 +172,7 @@ pub fn run(console: &mut Console) -> ! {
     let mut storage = [const { SocketStorage::EMPTY }; 1 + HTTP_CONNECTIONS];
     let mut sockets = SocketSet::new(&mut storage[..]);
     let echo_handle = sockets.add(socket);
-    #[cfg(not(feature = "userspace-test"))]
+    #[cfg(not(any(feature = "userspace-test", feature = "fuzz-test")))]
     let mut echo_buffer = [0; 2048];
     let mut http_handles = [echo_handle; HTTP_CONNECTIONS];
     for (index, (receive, transmit)) in http_receive_buffers
@@ -167,6 +188,14 @@ pub fn run(console: &mut Console) -> ! {
         http_handles[index] = sockets.add(socket);
     }
 
+    device
+        .guard
+        .expire(&mut sockets, &http_handles, clock.now_millis());
+    // Exercise the normal ingress path before test-only process runners take
+    // over. HTTP sockets are still closed, so no listener suspension is needed.
+    let initial_poll = Instant::from_millis(clock.now_millis());
+    device.prepare(initial_poll);
+    interface.poll_ingress_single(initial_poll, &mut device, &mut sockets);
     writeln!(console, "IPv4: 10.0.2.15/24, gateway 10.0.2.2").ok();
     writeln!(console, "TCP echo listening on 10.0.2.15:1234").ok();
     writeln!(
@@ -178,15 +207,18 @@ pub fn run(console: &mut Console) -> ! {
     writeln!(console, "Polling network. Use Ctrl-a x to exit QEMU.").ok();
 
     let mut process = Process::load(USER_IMAGE).expect("load userspace ELF");
+    crate::memory::check_permissions();
     writeln!(
         console,
         "Userspace: isolated RX/R/RW pages, NX stack, guarded stack"
     )
     .ok();
-    #[cfg(feature = "userspace-test")]
+    #[cfg(feature = "fuzz-test")]
+    crate::user_test::fuzz_run(&mut process, &mut sockets, &http_handles, &clock, console);
+    #[cfg(all(feature = "userspace-test", not(feature = "fuzz-test")))]
     crate::user_test::run(&mut process, &mut sockets, &http_handles, &clock, console);
 
-    #[cfg(not(feature = "userspace-test"))]
+    #[cfg(not(any(feature = "userspace-test", feature = "fuzz-test")))]
     run_process(
         console,
         &clock,
@@ -200,7 +232,7 @@ pub fn run(console: &mut Console) -> ! {
     );
 }
 
-#[cfg(not(feature = "userspace-test"))]
+#[cfg(not(any(feature = "userspace-test", feature = "fuzz-test")))]
 #[allow(clippy::too_many_arguments)]
 fn run_process(
     console: &mut Console,
@@ -214,13 +246,54 @@ fn run_process(
     echo_buffer: &mut [u8],
 ) -> ! {
     let mut running = true;
+    #[cfg(feature = "preemption-test")]
+    let mut phase = {
+        process.restart(13);
+        writeln!(console, "Preemption test: busy loop").ok();
+        0u8
+    };
+    #[cfg(feature = "preemption-test")]
+    let started = clock.now_millis();
+    #[cfg(feature = "preemption-test")]
+    let mut timer_returns = 0u64;
+    #[cfg(feature = "preemption-test")]
+    let mut budget_returns = 0u64;
     loop {
         let now = Instant::from_millis(clock.now_millis());
         // Handle the application between packets: a reset/last ACK and a new
         // SYN may already be queued together. Rearm the listener before that
         // SYN, and give TX/timers time even under continuous incoming traffic.
+        device
+            .guard
+            .expire(sockets, http_handles, now.total_millis());
+        device
+            .guard
+            .refresh(sockets, http_handles, now.total_millis());
         interface.poll_maintenance(now);
+        let existing_http = device.prepare(now);
+        let mut suspended = [false; HTTP_CONNECTIONS];
+        if existing_http {
+            // smoltcp dispatches to the first matching socket. Hide listeners
+            // for this single packet so an earlier free slot cannot steal a
+            // later connection's retransmitted SYN. Kernel IF=0 throughout;
+            // userspace cannot observe the temporary listener suspension.
+            for (index, handle) in http_handles.iter().enumerate() {
+                let socket = sockets.get_mut::<tcp::Socket>(*handle);
+                if socket.is_listening() {
+                    socket.abort();
+                    suspended[index] = true;
+                }
+            }
+        }
         interface.poll_ingress_single(now, device, sockets);
+        for (index, handle) in http_handles.iter().enumerate() {
+            if suspended[index] {
+                sockets
+                    .get_mut::<tcp::Socket>(*handle)
+                    .listen(abi::HTTP_PORT)
+                    .unwrap();
+            }
+        }
         let socket = sockets.get_mut::<tcp::Socket>(echo_handle);
         if socket.state() == tcp::State::Closed {
             socket.listen(ECHO_PORT).unwrap();
@@ -240,10 +313,19 @@ fn run_process(
             socket.close();
         }
         interface.poll_egress(now, device, sockets);
+        let mut calls = 0;
+        let slice_started = clock.now_millis();
         while running {
-            // SAFETY: one process, one CPU, IF=0. Its loader-owned pages are
+            // SAFETY: one process, one CPU; kernel IF=0, user IF=1. Its loader-owned pages are
             // disjoint from this supervisor stack and the descriptor tables.
             unsafe { arch::resume(&mut process.context) };
+            if process.context.vector == crate::timer::VECTOR {
+                #[cfg(feature = "preemption-test")]
+                {
+                    timer_returns += 1;
+                }
+                break;
+            }
             if process.context.vector != 128 {
                 writeln!(
                     console,
@@ -258,7 +340,19 @@ fn run_process(
             } else {
                 match syscall::dispatch(process, sockets, http_handles, clock, console) {
                     syscall::Action::Poll => break,
-                    syscall::Action::Continue => continue,
+                    syscall::Action::Continue => {
+                        calls += 1;
+                        // A process making only short syscalls cannot starve
+                        // NIC work by spending most of its time with IF clear.
+                        if calls >= 64 || clock.now_millis() - slice_started >= 10 {
+                            #[cfg(feature = "preemption-test")]
+                            {
+                                budget_returns += 1;
+                            }
+                            break;
+                        }
+                        continue;
+                    }
                     syscall::Action::Exit(code) => {
                         writeln!(console, "Userspace exited: {code}").ok();
                         running = false;
@@ -274,7 +368,22 @@ fn run_process(
             )
             .ok();
         }
-        // Interrupts are disabled, so HLT here would prevent future RX/timers.
+        #[cfg(feature = "preemption-test")]
+        {
+            let elapsed = clock.now_millis() - started;
+            if phase == 0 && elapsed >= 12_000 {
+                assert!(timer_returns >= 10, "busy process was not preempted");
+                process.restart(14);
+                phase = 1;
+                writeln!(console, "Preemption test: syscall loop").ok();
+            }
+            if phase == 1 && elapsed >= 15_000 {
+                assert!(budget_returns >= 10, "syscall budget was not enforced");
+                phase = 2;
+                writeln!(console, "Preemption fairness checks passed.").ok();
+            }
+        }
+        // Kernel IF is clear; keep polling when no process is runnable.
         core::hint::spin_loop();
     }
 }

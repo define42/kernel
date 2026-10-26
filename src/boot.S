@@ -183,9 +183,14 @@ boot_pdpt:
 .global boot_page_directory
 boot_page_directory:
     .skip 4096 * 4
-.balign 16
+.balign 4096
+.global boot_stack_guard
+boot_stack_guard:
+    .skip 4096
+.global boot_stack_bottom
 boot_stack_bottom:
     .skip 262144
+.global boot_stack_top
 boot_stack_top:
 
 .section .note.GNU-stack,"",@progbits

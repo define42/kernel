@@ -1,0 +1,11 @@
+[package]
+name = "kernel-host-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "../../src/abuse.rs"
+
+[dependencies]
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "auto-icmp-echo-reply", "socket-tcp"] }

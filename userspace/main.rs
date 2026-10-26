@@ -4,6 +4,8 @@
 
 #[path = "../abi.rs"]
 mod abi;
+#[cfg(userspace_test)]
+mod fuzz;
 mod http;
 mod syscall;
 
@@ -13,7 +15,7 @@ use core::panic::PanicInfo;
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
-pub extern "C" fn _start(mode: u64) -> ! {
+pub extern "C" fn _start(mode: u64, seed: u64, iterations: u64) -> ! {
     let code_segment: u16;
     // SAFETY: reading CS is unprivileged and does not modify machine state.
     unsafe {
@@ -27,10 +29,13 @@ pub extern "C" fn _start(mode: u64) -> ! {
 
     #[cfg(userspace_test)]
     if mode != 0 {
+        if mode == 15 {
+            fuzz::run(seed, iterations);
+        }
         run_probe(mode);
     }
     #[cfg(not(userspace_test))]
-    let _ = mode;
+    let _ = (mode, seed, iterations);
 
     let mut connections = [const { http::Connection::new() }; abi::SOCKET_COUNT];
     let mut sockets = core::array::from_fn::<_, { abi::SOCKET_COUNT }, _>(syscall::Socket::new);
@@ -115,6 +120,10 @@ fn run_probe(mode: u64) -> ! {
                 in("rax") abi::SYS_NOW,
                 options(noreturn),
             ),
+            13 => asm!("2:", "pause", "jmp 2b", options(noreturn)),
+            14 => loop {
+                syscall::raw(abi::SYS_NOW, 0, 0, 0);
+            },
             _ => {}
         }
     }

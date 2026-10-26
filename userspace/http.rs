@@ -94,7 +94,9 @@ impl Connection {
             // TIME-WAIT has no outstanding response data. smoltcp permits
             // listening here, avoiding a minute-long pause between clients.
             *self = Self::new();
-            socket.listen(PORT).expect("valid HTTP listen port");
+            // A timer may change socket state between a snapshot and this
+            // syscall. Retry on a later poll instead of stopping the process.
+            let _ = socket.listen(PORT);
             return;
         }
         if socket.is_listening() {
@@ -108,10 +110,15 @@ impl Connection {
                 return;
             }
             if socket.can_recv() {
-                let count = socket
-                    .recv_slice(&mut self.headers[self.used..])
-                    .expect("HTTP receive data available");
-                self.used += count;
+                match socket.recv_slice(&mut self.headers[self.used..]) {
+                    Ok(count) => self.used += count,
+                    Err(crate::abi::EAGAIN) => return,
+                    Err(_) => {
+                        socket.abort();
+                        *self = Self::new();
+                        return;
+                    }
+                }
             }
             if let Some(end) = self.headers[..self.used]
                 .windows(4)
@@ -141,7 +148,15 @@ impl Connection {
             } else {
                 &self.body[self.body_sent..]
             };
-            let count = socket.send_slice(bytes).expect("HTTP socket can send");
+            let count = match socket.send_slice(bytes) {
+                Ok(count) => count,
+                Err(crate::abi::EAGAIN) => return,
+                Err(_) => {
+                    socket.abort();
+                    *self = Self::new();
+                    return;
+                }
+            };
             if self.sent < self.used {
                 self.sent += count;
             } else {

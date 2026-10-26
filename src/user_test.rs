@@ -4,6 +4,7 @@ use crate::{abi, arch, console::Console, syscall, time::Clock, userspace::Proces
 use core::fmt::Write;
 use smoltcp::iface::{SocketHandle, SocketSet};
 
+#[cfg(all(feature = "userspace-test", not(feature = "fuzz-test")))]
 pub fn run(
     process: &mut Process,
     sockets: &mut SocketSet<'_>,
@@ -11,15 +12,42 @@ pub fn run(
     clock: &Clock,
     console: &mut Console,
 ) -> ! {
-    for mode in 1..=12 {
+    crate::memory::check_permissions();
+    let (text, data) = crate::memory::probe_addresses();
+    // SAFETY: these narrowly scoped probes recover only their expected page
+    // fault at an exact instruction/address; the NX target contains RET.
+    unsafe {
+        assert_eq!(
+            arch::probe_write(text),
+            Some(3),
+            "kernel text must reject writes"
+        );
+        assert_eq!(
+            arch::probe_execute(data),
+            Some(17),
+            "kernel data must reject execution"
+        );
+    }
+    writeln!(console, "Kernel WP/NX fault checks passed.").ok();
+    let ticks_before = crate::timer::ticks();
+    for mode in 1..=13 {
         process.restart(mode);
         let mut calls = 0;
+        let mut preemptions = 0;
         loop {
             // SAFETY: the loader owns the user pages; descriptor tables and
             // this context remain supervisor-only on our single CPU.
             unsafe { arch::resume(&mut process.context) };
             let context = process.context;
             assert_eq!(context.cs & 3, 3);
+            if context.vector == arch::TIMER_VECTOR {
+                preemptions += 1;
+                if mode == 13 && preemptions >= 3 {
+                    writeln!(console, "Ring-3 probe 13: busy loop preempted three times").ok();
+                    break;
+                }
+                continue;
+            }
             if context.vector != 128 {
                 match mode {
                     3..=5 | 7 => {
@@ -72,6 +100,58 @@ pub fn run(
             }
         }
     }
+    assert!(crate::timer::ticks() >= ticks_before + 3);
     writeln!(console, "Userspace isolation checks passed.").ok();
     crate::exit_qemu(0x10);
+}
+
+#[cfg(feature = "fuzz-test")]
+pub fn fuzz_run(
+    process: &mut Process,
+    sockets: &mut SocketSet<'_>,
+    handles: &[SocketHandle; abi::SOCKET_COUNT],
+    clock: &Clock,
+    console: &mut Console,
+) -> ! {
+    let seed: u64 = env!("KERNEL_FUZZ_SEED").parse().expect("fuzz seed");
+    let iterations: u64 = env!("KERNEL_FUZZ_ITERATIONS")
+        .parse()
+        .expect("fuzz iterations");
+    writeln!(console, "Syscall fuzz: seed={seed} iterations={iterations}").ok();
+    process.restart(15);
+    process.context.rsi = seed;
+    process.context.rdx = iterations;
+    let mut calls = 0u64;
+    let mut preemptions = 0u64;
+    loop {
+        // SAFETY: same isolated process and mappings as the normal scheduler.
+        unsafe { arch::resume(&mut process.context) };
+        let context = process.context;
+        if context.vector == arch::TIMER_VECTOR {
+            preemptions += 1;
+            continue;
+        }
+        assert_eq!(
+            context.vector, 128,
+            "fuzz seed={seed} calls={calls}: {context:?}"
+        );
+        calls += 1;
+        if calls.is_multiple_of(16384) {
+            writeln!(console, "Syscall fuzz progress: seed={seed} calls={calls}").ok();
+        }
+        match syscall::dispatch(process, sockets, handles, clock, console) {
+            syscall::Action::Exit(code) => {
+                assert_eq!(code, 0, "syscall fuzz failed seed={seed} calls={calls}");
+                assert!(calls >= iterations, "syscall fuzz terminated early");
+                crate::memory::check_permissions();
+                writeln!(
+                    console,
+                    "Syscall fuzz passed: seed={seed} calls={calls} preemptions={preemptions}"
+                )
+                .ok();
+                crate::exit_qemu(0x10);
+            }
+            syscall::Action::Continue | syscall::Action::Poll => {}
+        }
+    }
 }

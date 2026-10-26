@@ -1,4 +1,4 @@
-//! One isolated, cooperatively scheduled ELF process.
+//! One isolated ELF process with timer-preempted user execution.
 //!
 //! Only this process's 2 MiB virtual window has user-accessible leaf entries.
 //! Its physical backing stays accessible through the supervisor identity map,
@@ -117,7 +117,7 @@ impl Process {
     pub fn restart(&mut self, arg: u64) {
         let backing = addr_of_mut!(BACKING).cast::<u8>();
         // SAFETY: this process exclusively owns BACKING, and no user code runs
-        // concurrently on this single-CPU cooperative kernel. ELF ranges were
+        // concurrently while this single CPU runs kernel code with IF clear. Ranges were
         // validated before the process was constructed.
         unsafe {
             write_bytes(backing, 0, REGION_SIZE);

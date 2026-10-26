@@ -25,19 +25,26 @@ SECTIONS
         *(.text .text.*)
     } :text
 
-    .rodata ALIGN(16) :
+    . = ALIGN(4096);
+    __text_end = .;
+    __rodata_start = .;
+
+    .rodata ALIGN(4096) :
     {
         *(.rodata .rodata.* .srodata .srodata.*)
+        . = ALIGN(4096);
     } :rodata
+    __rodata_end = .;
+    __data_start = .;
 
-    .data ALIGN(16) :
+    .data ALIGN(4096) :
     {
         *(.data .data.* .sdata .sdata.*)
         *(.got .got.*)
         /* Guarantee a final initialized section even without Rust globals.
            Its end must equal the exact end of the objcopy flat binary. */
         BYTE(0)
-        . = ALIGN(8);
+        . = ALIGN(4096);
         __load_end = .;
     } :data
 
@@ -64,5 +71,5 @@ SECTIONS
            "Multiboot header must be inside the first 8 KiB")
     ASSERT((ADDR(.multiboot) & 3) == 0, "Multiboot header must be aligned")
     ASSERT(((__bss_end - __bss_start) & 3) == 0, "BSS must contain whole dwords")
-    ASSERT(__kernel_end < 0x40000000, "Kernel exceeds the initial 1 GiB identity mapping")
+    ASSERT(__kernel_end <= 0x02000000, "Kernel exceeds the 32 MiB protected-page-table capacity")
 }

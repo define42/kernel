@@ -1,4 +1,4 @@
-//! Single-CPU ring-3 transitions. Userspace runs cooperatively with IF = 0.
+//! Single-CPU ring-3 transitions with timer preemption of userspace.
 //!
 //! All descriptor tables, trap stacks, and saved kernel state remain in the
 //! supervisor-only identity mapping. Only the syscall interrupt has DPL 3.
@@ -8,7 +8,10 @@ use core::mem::{offset_of, size_of};
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-global_asm!(include_str!("traps.S"));
+global_asm!(
+    include_str!("traps.S"),
+    test_probes = const cfg!(feature = "userspace-test") as u8,
+);
 
 const KERNEL_CODE: u16 = 0x08;
 const KERNEL_DATA: u16 = 0x10;
@@ -16,6 +19,8 @@ const USER_DATA: u64 = 0x1b;
 const USER_CODE: u64 = 0x23;
 const TSS_SELECTOR: u16 = 0x28;
 const STACK_BYTES: usize = 32 * 1024;
+const GUARD_BYTES: usize = 4096;
+pub const TIMER_VECTOR: u64 = 32;
 
 /// Saved general registers followed by the normalized x86-64 trap frame.
 ///
@@ -72,7 +77,7 @@ impl Context {
             error_code: 0,
             rip: entry,
             cs: USER_CODE,
-            rflags: 2,
+            rflags: 0x202,
             rsp: stack,
             ss: USER_DATA,
             cr2: 0,
@@ -162,15 +167,15 @@ struct TablePointer {
     base: u64,
 }
 
-#[repr(C, align(16))]
-struct Stack([u8; STACK_BYTES]);
+#[repr(C, align(4096))]
+struct Stack([u8; GUARD_BYTES + STACK_BYTES]);
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut TSS: TaskStateSegment = TaskStateSegment::EMPTY;
 static mut GDT: [u64; 7] = [0; 7];
 static mut IDT: [Gate; 256] = [Gate::EMPTY; 256];
-static mut TRAP_STACK: Stack = Stack([0; STACK_BYTES]);
-static mut DOUBLE_FAULT_STACK: Stack = Stack([0; STACK_BYTES]);
+static mut TRAP_STACK: Stack = Stack([0; GUARD_BYTES + STACK_BYTES]);
+static mut DOUBLE_FAULT_STACK: Stack = Stack([0; GUARD_BYTES + STACK_BYTES]);
 
 unsafe extern "C" {
     fn arch_load_gdt(pointer: *const TablePointer);
@@ -178,12 +183,17 @@ unsafe extern "C" {
     fn arch_int80();
     fn arch_unexpected();
     static arch_exception_vectors: [u64; 32];
+    static arch_irq_vectors: [u64; 16];
+    #[cfg(feature = "userspace-test")]
+    fn arch_probe_write(address: u64) -> u64;
+    #[cfg(feature = "userspace-test")]
+    fn arch_probe_execute(address: u64) -> u64;
 }
 
 /// Install the GDT, TSS, and IDT on the sole bootstrap CPU.
 ///
-/// The kernel never starts other CPUs or enables external interrupts. This
-/// wrapper checks the required privilege/interrupt state and rejects reuse.
+/// The kernel never starts other CPUs and keeps IF clear while in ring 0.
+/// This wrapper checks the privilege/interrupt state and rejects reuse.
 /// The static tables stay resident for the remainder of the kernel lifetime.
 pub fn init() {
     let flags: u64;
@@ -205,8 +215,8 @@ pub fn init() {
     // supervisor mapped. Packed TSS fields are written without aligned refs.
     unsafe {
         let tss = addr_of_mut!(TSS);
-        let trap_top = addr_of!(TRAP_STACK) as u64 + STACK_BYTES as u64;
-        let double_fault_top = addr_of!(DOUBLE_FAULT_STACK) as u64 + STACK_BYTES as u64;
+        let trap_top = addr_of!(TRAP_STACK) as u64 + size_of::<Stack>() as u64;
+        let double_fault_top = addr_of!(DOUBLE_FAULT_STACK) as u64 + size_of::<Stack>() as u64;
         addr_of_mut!((*tss).rsp).write_unaligned([trap_top, 0, 0]);
         addr_of_mut!((*tss).ist).write_unaligned([double_fault_top, 0, 0, 0, 0, 0, 0]);
 
@@ -247,6 +257,11 @@ pub fn init() {
                 u8::from(vector == 8), // Double fault uses dedicated IST1.
             ));
         }
+        let irqs = addr_of!(arch_irq_vectors).cast::<u64>();
+        for irq in 0..16 {
+            idt.add(TIMER_VECTOR as usize + irq)
+                .write(Gate::interrupt(irqs.add(irq).read(), 0, 0));
+        }
         idt.add(0x80)
             .write(Gate::interrupt(arch_int80 as *const () as u64, 3, 0));
         let idt_pointer = TablePointer {
@@ -257,7 +272,7 @@ pub fn init() {
     }
 }
 
-/// Run userspace until its next INT 0x80 or exception, then update `context`.
+/// Run userspace until INT 0x80, IRQ0, or an exception, updating `context`.
 ///
 /// # Safety
 /// Call only on the bootstrap CPU after `init`, with external interrupts
@@ -281,11 +296,46 @@ pub unsafe fn resume(context: &mut Context) {
         context.error_code = 0;
         return;
     }
-    // Preserve arithmetic flags and DF, but do not allow a saved frame to
-    // enable interrupts, I/O privilege, single stepping, or nested tasks.
-    context.rflags = (context.rflags & 0x0cd5) | 2;
+    // Preserve arithmetic flags and DF. Force IF on so ring 3 cannot evade
+    // preemption; IOPL stays zero so POPFQ cannot clear IF and CLI faults.
+    // Single stepping, AC, and nested-task state are never restored here.
+    context.rflags = (context.rflags & 0x0cd5) | 0x202;
     // SAFETY: the caller guarantees the mapping/lifetime/CPU invariants above.
     unsafe { arch_resume(context) };
+}
+
+/// Supervisor guard pages to remove from the identity mapping before entry.
+pub fn guard_pages() -> [u64; 2] {
+    [
+        addr_of!(TRAP_STACK) as u64,
+        addr_of!(DOUBLE_FAULT_STACK) as u64,
+    ]
+}
+
+/// Attempt a same-value byte write and return the page-fault error code.
+///
+/// # Safety
+/// Test-only: call on the bootstrap CPU with IF clear, outside any other probe.
+/// `address` must point to a readable kernel byte. The handler accepts only a
+/// page fault at the exact probe instruction and fault address; other faults
+/// retain the normal fatal handling. `None` means the write was permitted.
+#[cfg(feature = "userspace-test")]
+pub unsafe fn probe_write(address: u64) -> Option<u64> {
+    // SAFETY: the caller provides the readable address and CPU invariants.
+    let error = unsafe { arch_probe_write(address) };
+    (error != u64::MAX).then_some(error)
+}
+
+/// Attempt to execute a single RET byte and return the page-fault error code.
+///
+/// # Safety
+/// The same CPU/probe rules as `probe_write` apply. The readable kernel target
+/// must contain 0xc3 (RET), so the non-faulting case safely returns unchanged.
+#[cfg(feature = "userspace-test")]
+pub unsafe fn probe_execute(address: u64) -> Option<u64> {
+    // SAFETY: the caller supplies a RET target and the CPU invariants above.
+    let error = unsafe { arch_probe_execute(address) };
+    (error != u64::MAX).then_some(error)
 }
 
 fn canonical(address: u64) -> bool {
