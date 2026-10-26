@@ -9,6 +9,7 @@ smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-e
 
 [features]
 smoke-test = []
+userspace-test = []
 
 [[bin]]
 name = "kernel"

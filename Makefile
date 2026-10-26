@@ -2,6 +2,7 @@
 .DELETE_ON_ERROR:
 
 CARGO ?= cargo
+CLIPPY_DRIVER ?= clippy-driver
 OBJCOPY ?= objcopy
 QEMU ?= qemu-system-x86_64
 PYTHON ?= python3
@@ -12,12 +13,14 @@ QEMU_FLAGS ?=
 
 TARGET := x86_64-unknown-none
 KERNEL_ELF := target/$(TARGET)/release/kernel
+USER_TEST_ELF := target/userspace-test/$(TARGET)/release/kernel
+USER_TEST_BIN := build/userspace-test/kernel.bin
 TEST_ELF := target/smoke-test/$(TARGET)/release/kernel
 KERNEL_BIN := build/kernel.bin
 TEST_BIN := build/test/kernel.bin
 QEMU_COMMON := -machine pc -accel tcg -m 128M -smp 1 -no-reboot -no-shutdown
 
-.PHONY: all build kernel setup run run-gui debug test test-boot test-net test-packets test-http check clean help
+.PHONY: all build kernel setup run run-gui debug test test-boot test-net test-packets test-http test-userspace check clean help
 
 all: kernel
 build: kernel
@@ -30,6 +33,7 @@ kernel:
 	$(CARGO) build --release --target $(TARGET) --target-dir target
 	@mkdir -p build
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_BIN)
+	cp target/$(TARGET)/release/webserver.elf build/webserver.elf
 
 # Serial console in this terminal; Ctrl-a x exits QEMU.
 run: kernel
@@ -44,13 +48,19 @@ debug: kernel
 	$(QEMU) $(QEMU_COMMON) $(QEMU_NET) -kernel $(KERNEL_BIN) -display none -serial mon:stdio -S -gdb tcp:127.0.0.1:1234 $(QEMU_FLAGS)
 
 # Isolate the test feature's artifacts from the normal boot image.
-test: test-boot test-net test-packets test-http
+test: test-boot test-userspace test-net test-packets test-http
 
 test-boot:
 	$(CARGO) build --release --features smoke-test --target $(TARGET) --target-dir target/smoke-test
 	@mkdir -p build/test
 	$(OBJCOPY) -O binary $(TEST_ELF) $(TEST_BIN)
 	$(PYTHON) scripts/smoke_test.py "$(QEMU)" $(TEST_BIN)
+
+test-userspace:
+	$(CARGO) build --release --features userspace-test --target $(TARGET) --target-dir target/userspace-test
+	@mkdir -p build/userspace-test
+	$(OBJCOPY) -O binary $(USER_TEST_ELF) $(USER_TEST_BIN)
+	$(PYTHON) scripts/userspace_test.py "$(QEMU)" $(USER_TEST_BIN)
 
 test-net: kernel
 	$(PYTHON) scripts/network_test.py "$(QEMU)" $(KERNEL_BIN)
@@ -63,8 +73,13 @@ test-http: kernel
 
 check:
 	$(CARGO) fmt --all -- --check
+	rustfmt --edition 2024 --check userspace/main.rs
 	$(CARGO) clippy --target $(TARGET) -- -D warnings
+	$(CARGO) clippy --features userspace-test --target $(TARGET) -- -D warnings
 	$(CARGO) clippy --all-features --target $(TARGET) -- -D warnings
+	@mkdir -p target/userspace-check
+	$(CLIPPY_DRIVER) --edition=2024 --crate-name webserver --crate-type bin --target $(TARGET) --emit=metadata -Cpanic=abort --check-cfg 'cfg(userspace_test)' userspace/main.rs -o target/userspace-check/webserver.rmeta -D warnings
+	$(CLIPPY_DRIVER) --edition=2024 --crate-name webserver --crate-type bin --target $(TARGET) --emit=metadata -Cpanic=abort --check-cfg 'cfg(userspace_test)' --cfg userspace_test userspace/main.rs -o target/userspace-check/webserver-test.rmeta -D warnings
 
 clean:
 	$(CARGO) clean --target-dir target
@@ -77,10 +92,11 @@ help:
 	  'make run       Boot QEMU in this terminal (Ctrl-a x to exit)' \
 	  'make run-gui   Boot QEMU with a VGA window and serial console' \
 	  'make debug     Wait for GDB on localhost:1234 before booting' \
-	  'make test      Run boot, TCP, ARP/ICMP, and HTTP checks in QEMU' \
+	  'make test      Run boot, ring-3 isolation, TCP, ARP/ICMP, and HTTP checks in QEMU' \
 	  'make test-net  Test TCP echo, ring wrap, reconnects, and close/reset' \
 	  'make test-packets  Test ARP, IPv4/ICMP, and checksum rejection' \
 	  'make test-boot Run the original CPU/memory boot checks' \
 	  'make test-http Test HTTP requests, errors, concurrency, and timeouts' \
+	  'make test-userspace  Test ring-3 privileges, syscalls, and fault containment' \
 	  'make check     Check Rust formatting and Clippy lints' \
 	  'make clean     Remove generated files'

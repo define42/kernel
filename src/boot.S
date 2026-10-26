@@ -174,10 +174,13 @@ boot_gdt_pointer:
 
 .section .bss.boot,"aw",@nobits
 .balign 4096
+.global boot_pml4
 boot_pml4:
     .skip 4096
+.global boot_pdpt
 boot_pdpt:
     .skip 4096
+.global boot_page_directory
 boot_page_directory:
     .skip 4096 * 4
 .balign 16

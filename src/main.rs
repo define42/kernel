@@ -1,17 +1,26 @@
 #![no_std]
 #![no_main]
 
+#[cfg(not(feature = "smoke-test"))]
+#[path = "../abi.rs"]
+mod abi;
+#[cfg(not(feature = "smoke-test"))]
+mod arch;
 mod console;
 #[cfg(not(feature = "smoke-test"))]
 mod e1000;
-#[cfg(not(feature = "smoke-test"))]
-mod http;
 #[cfg(not(feature = "smoke-test"))]
 mod net;
 #[cfg(not(feature = "smoke-test"))]
 mod pci;
 #[cfg(not(feature = "smoke-test"))]
+mod syscall;
+#[cfg(not(feature = "smoke-test"))]
 mod time;
+#[cfg(all(feature = "userspace-test", not(feature = "smoke-test")))]
+mod user_test;
+#[cfg(not(feature = "smoke-test"))]
+mod userspace;
 
 use core::arch::{asm, global_asm};
 use core::fmt::Write;
@@ -75,6 +84,7 @@ extern "C" fn kernel_main(magic: u32, info_addr: u32) -> ! {
 
     #[cfg(not(feature = "smoke-test"))]
     {
+        arch::init();
         net::run(&mut console);
     }
 }
@@ -116,13 +126,13 @@ fn panic(info: &PanicInfo) -> ! {
     // again. Reinitializing here also makes early boot panics visible.
     let mut console = Console::new();
     writeln!(console, "KERNEL PANIC: {info}").ok();
-    #[cfg(feature = "smoke-test")]
+    #[cfg(any(feature = "smoke-test", feature = "userspace-test"))]
     exit_qemu(0x11);
-    #[cfg(not(feature = "smoke-test"))]
+    #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
     halt();
 }
 
-#[cfg(feature = "smoke-test")]
+#[cfg(any(feature = "smoke-test", feature = "userspace-test"))]
 fn exit_qemu(code: u32) -> ! {
     // SAFETY: make test attaches QEMU's isa-debug-exit device at this port.
     // QEMU returns (code << 1) | 1 to the host, so success (0x10) becomes 33.
@@ -135,7 +145,7 @@ fn exit_qemu(code: u32) -> ! {
 fn halt() -> ! {
     loop {
         // SAFETY: this kernel runs at ring 0; with interrupts disabled, HLT
-        // stops consuming CPU until an NMI/reset. No IDT is installed yet.
+        // stops consuming CPU until an NMI/reset.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
     }
 }

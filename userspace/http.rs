@@ -2,10 +2,9 @@
 
 use core::fmt::{self, Write};
 
-use smoltcp::socket::tcp;
+use crate::syscall::{Socket, State};
 
-pub const PORT: u16 = 80;
-pub const SOCKET_BUFFER_SIZE: usize = 4096;
+const PORT: u16 = crate::abi::HTTP_PORT;
 const MAX_HEADERS: usize = 2048;
 const REQUEST_TIMEOUT_MS: i64 = 5000;
 const STALL_TIMEOUT_MS: i64 = 10_000;
@@ -20,9 +19,9 @@ a{color:#72e0bd}.label{color:#72e0bd;letter-spacing:.15em;font-size:.8rem}
 code{color:#b9d8ef}footer{margin-top:3rem;color:#a1b4c2;font-size:.9rem}
 </style></head><body><main><p class="label">BARE METAL / ONLINE</p>
 <h1>Hello from the Rust kernel.</h1>
-<p>This page is served directly by a small Rust kernel running in QEMU.</p>
+<p>This page is served by an isolated Rust userspace process running in ring 3.</p>
 <p>An Intel e1000 NIC connects the kernel to an IPv4 and TCP network, powered by smoltcp.</p>
-<p>No operating system underneath. No heap required.</p>
+<p>The kernel handles network traffic; this process handles HTTP. No heap required.</p>
 <p><a href="/healthz">Check server health &rarr;</a></p>
 <footer>Guest <code>10.0.2.15:80</code> &middot; HTTP/1.1 &middot; Rust</footer>
 </main></body></html>
@@ -90,7 +89,7 @@ impl Connection {
         }
     }
 
-    pub fn poll(&mut self, socket: &mut tcp::Socket<'_>, now_millis: i64) {
+    pub fn poll(&mut self, socket: &mut Socket, now_millis: i64) {
         if !socket.is_open() {
             // TIME-WAIT has no outstanding response data. smoltcp permits
             // listening here, avoiding a minute-long pause between clients.
@@ -122,7 +121,7 @@ impl Connection {
                 self.respond(response, now_millis);
             } else if self.used == MAX_HEADERS {
                 self.respond(Response::HeaderTooLarge, now_millis);
-            } else if socket.state() == tcp::State::CloseWait && !socket.can_recv() {
+            } else if socket.state() == State::CloseWait && !socket.can_recv() {
                 self.respond(Response::BadRequest, now_millis);
             }
         }

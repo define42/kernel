@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot QEMU and exercise the kernel HTTP server through its e1000 NIC."""
+"""Boot QEMU and exercise the userspace HTTP server through its e1000 NIC."""
 
 import argparse
 from contextlib import ExitStack
@@ -16,6 +16,7 @@ from network_test import (check_process, positive_timeout, remaining, show_logs,
                           stop_qemu)
 
 
+USERSPACE_MARKER = b"Userspace web server: CPL=3"
 READY_MARKER = b"HTTP listening on 10.0.2.15:80"
 MAX_RESPONSE = 65536
 REQUEST = b"GET /healthz HTTP/1.1\r\nHost: kernel\r\n\r\n"
@@ -49,7 +50,11 @@ def launch_qemu(args: argparse.Namespace, serial_path: Path,
                     if port_conflict and attempt < 2:
                         break
                     check_process(process)
-                if READY_MARKER in serial_path.read_bytes():
+                serial_output = serial_path.read_bytes()
+                ready_index = serial_output.find(READY_MARKER)
+                if ready_index >= 0:
+                    if USERSPACE_MARKER not in serial_output[:ready_index].splitlines():
+                        raise RuntimeError("HTTP became ready without a preceding userspace CPL=3 marker")
                     return process, port
                 time.sleep(min(0.02, remaining(deadline)))
         except BaseException:
@@ -209,6 +214,8 @@ def run_http_checks(port: int, deadline: float, process: subprocess.Popen) -> No
                                       deadline, process, timeout=10.0), 200, "text/html")
     if b"Rust kernel" not in page:
         raise RuntimeError("root page does not identify the Rust kernel")
+    if b"userspace process running in ring 3" not in page:
+        raise RuntimeError("root page does not identify the ring-3 userspace server")
     validate(exchange(port, b"HEAD / HTTP/1.1\r\nHost: kernel\r\n\r\n", deadline, process),
              200, "text/html", head_length=int(headers["content-length"]))
     validate(exchange(port, REQUEST, deadline, process), 200, body=b"ok\n")

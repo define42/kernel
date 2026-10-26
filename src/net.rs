@@ -10,13 +10,16 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 
 use crate::console::Console;
 use crate::e1000::{E1000, MAX_FRAME_SIZE};
-use crate::http;
 use crate::time::Clock;
+use crate::{abi, userspace::Process};
+#[cfg(not(feature = "userspace-test"))]
+use crate::{arch, syscall};
 
 const FRAME_SIZE: usize = MAX_FRAME_SIZE; // Includes the 14-byte Ethernet header.
 const SOCKET_BUFFER_SIZE: usize = 16 * 1024;
 const ECHO_PORT: u16 = 1234;
-const HTTP_CONNECTIONS: usize = 4;
+const HTTP_CONNECTIONS: usize = abi::SOCKET_COUNT;
+const USER_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/webserver.elf"));
 
 /// Owns the NIC and a CPU-only copy of the most recently received frame.
 struct EthernetDevice {
@@ -143,12 +146,12 @@ pub fn run(console: &mut Console) -> ! {
     socket.set_timeout(Some(Duration::from_secs(30)));
     socket.set_keep_alive(Some(Duration::from_secs(10)));
     socket.listen(ECHO_PORT).unwrap();
-    let mut http_receive_buffers = [[0; http::SOCKET_BUFFER_SIZE]; HTTP_CONNECTIONS];
-    let mut http_transmit_buffers = [[0; http::SOCKET_BUFFER_SIZE]; HTTP_CONNECTIONS];
-    let mut http_connections = [const { http::Connection::new() }; HTTP_CONNECTIONS];
+    let mut http_receive_buffers = [[0; abi::SOCKET_BUFFER_SIZE]; HTTP_CONNECTIONS];
+    let mut http_transmit_buffers = [[0; abi::SOCKET_BUFFER_SIZE]; HTTP_CONNECTIONS];
     let mut storage = [const { SocketStorage::EMPTY }; 1 + HTTP_CONNECTIONS];
     let mut sockets = SocketSet::new(&mut storage[..]);
     let echo_handle = sockets.add(socket);
+    #[cfg(not(feature = "userspace-test"))]
     let mut echo_buffer = [0; 2048];
     let mut http_handles = [echo_handle; HTTP_CONNECTIONS];
     for (index, (receive, transmit)) in http_receive_buffers
@@ -161,7 +164,6 @@ pub fn run(console: &mut Console) -> ! {
             tcp::SocketBuffer::new(&mut transmit[..]),
         );
         socket.set_timeout(Some(Duration::from_secs(10)));
-        http_connections[index].poll(&mut socket, clock.now_millis());
         http_handles[index] = sockets.add(socket);
     }
 
@@ -172,17 +174,53 @@ pub fn run(console: &mut Console) -> ! {
         "Host: connect to 127.0.0.1:5555 (make run default)"
     )
     .ok();
-    writeln!(console, "HTTP listening on 10.0.2.15:80").ok();
     writeln!(console, "Web: http://127.0.0.1:8080/ (make run default)").ok();
     writeln!(console, "Polling network. Use Ctrl-a x to exit QEMU.").ok();
 
+    let mut process = Process::load(USER_IMAGE).expect("load userspace ELF");
+    writeln!(
+        console,
+        "Userspace: isolated RX/R/RW pages, NX stack, guarded stack"
+    )
+    .ok();
+    #[cfg(feature = "userspace-test")]
+    crate::user_test::run(&mut process, &mut sockets, &http_handles, &clock, console);
+
+    #[cfg(not(feature = "userspace-test"))]
+    run_process(
+        console,
+        &clock,
+        &mut device,
+        &mut interface,
+        &mut sockets,
+        echo_handle,
+        &http_handles,
+        &mut process,
+        &mut echo_buffer,
+    );
+}
+
+#[cfg(not(feature = "userspace-test"))]
+#[allow(clippy::too_many_arguments)]
+fn run_process(
+    console: &mut Console,
+    clock: &Clock,
+    device: &mut EthernetDevice,
+    interface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    echo_handle: smoltcp::iface::SocketHandle,
+    http_handles: &[smoltcp::iface::SocketHandle; HTTP_CONNECTIONS],
+    process: &mut Process,
+    echo_buffer: &mut [u8],
+) -> ! {
+    let mut running = true;
     loop {
         let now = Instant::from_millis(clock.now_millis());
         // Handle the application between packets: a reset/last ACK and a new
         // SYN may already be queued together. Rearm the listener before that
         // SYN, and give TX/timers time even under continuous incoming traffic.
         interface.poll_maintenance(now);
-        interface.poll_ingress_single(now, &mut device, &mut sockets);
+        interface.poll_ingress_single(now, device, sockets);
         let socket = sockets.get_mut::<tcp::Socket>(echo_handle);
         if socket.state() == tcp::State::Closed {
             socket.listen(ECHO_PORT).unwrap();
@@ -201,10 +239,41 @@ pub fn run(console: &mut Console) -> ! {
         if socket.state() == tcp::State::CloseWait && !socket.can_recv() {
             socket.close();
         }
-        for (connection, handle) in http_connections.iter_mut().zip(http_handles) {
-            connection.poll(sockets.get_mut::<tcp::Socket>(handle), now.total_millis());
+        interface.poll_egress(now, device, sockets);
+        while running {
+            // SAFETY: one process, one CPU, IF=0. Its loader-owned pages are
+            // disjoint from this supervisor stack and the descriptor tables.
+            unsafe { arch::resume(&mut process.context) };
+            if process.context.vector != 128 {
+                writeln!(
+                    console,
+                    "Userspace fault: vector={} error={:#x} rip={:#x} address={:#x}",
+                    process.context.vector,
+                    process.context.error_code,
+                    process.context.rip,
+                    process.context.cr2
+                )
+                .ok();
+                running = false;
+            } else {
+                match syscall::dispatch(process, sockets, http_handles, clock, console) {
+                    syscall::Action::Poll => break,
+                    syscall::Action::Continue => continue,
+                    syscall::Action::Exit(code) => {
+                        writeln!(console, "Userspace exited: {code}").ok();
+                        running = false;
+                    }
+                }
+            }
+            for handle in http_handles {
+                sockets.get_mut::<tcp::Socket>(*handle).abort();
+            }
+            writeln!(
+                console,
+                "Web process stopped; kernel TCP echo remains available."
+            )
+            .ok();
         }
-        interface.poll_egress(now, &mut device, &mut sockets);
         // Interrupts are disabled, so HLT here would prevent future RX/timers.
         core::hint::spin_loop();
     }
