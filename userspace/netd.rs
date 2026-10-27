@@ -3,11 +3,14 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 #[path = "../abi.rs"]
 mod abi;
 #[path = "../src/abuse.rs"]
 mod abuse;
 mod arp_announce;
+mod heap;
 mod net_syscall;
 mod network_config;
 
@@ -116,6 +119,12 @@ impl phy::TxToken for TransmitToken {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
 pub extern "C" fn _start(mode: u64, _seed: u64, _iterations: u64) -> ! {
+    // SAFETY: the loader supplies a fresh private heap and allocator state on
+    // every entry. This process has not allocated or started any user threads.
+    assert!(
+        unsafe { heap::init() },
+        "userspace heap initialization failed"
+    );
     let code_segment: u16;
     // SAFETY: CS is readable at every privilege level.
     unsafe {

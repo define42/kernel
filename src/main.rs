@@ -39,13 +39,18 @@ mod setup_plan;
 mod shell;
 #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
 mod shell_input;
+#[cfg(all(feature = "std-test", not(feature = "smoke-test")))]
+mod std_test;
 #[cfg(all(not(feature = "smoke-test"), feature = "userspace-test"))]
 mod syscall;
 #[cfg(not(feature = "smoke-test"))]
 mod time;
 #[cfg(not(feature = "smoke-test"))]
 mod timer;
-#[cfg(all(feature = "userspace-test", not(feature = "smoke-test")))]
+#[cfg(all(
+    feature = "userspace-test",
+    not(any(feature = "smoke-test", feature = "std-test"))
+))]
 mod user_test;
 #[cfg(not(feature = "smoke-test"))]
 mod userspace;

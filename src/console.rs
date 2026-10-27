@@ -68,6 +68,36 @@ impl Console {
         self.vga_byte(byte);
     }
 
+    /// A bounded stdout/stderr write. The returned count covers only input
+    /// bytes retained for serial transmission, not inserted CRLF/framing bytes.
+    /// Invalid UTF-8 is transmitted unchanged. Displaying such bytes on VGA is
+    /// necessarily approximate, as it is for the existing console log path.
+    #[cfg(not(feature = "smoke-test"))]
+    pub fn write_user_bytes(&mut self, bytes: &[u8]) -> Result<usize, ()> {
+        let mut accepted = 0;
+        for &byte in bytes {
+            #[cfg(not(feature = "userspace-test"))]
+            if self.defer_logs {
+                if !self.logs.try_push_console(byte) {
+                    break;
+                }
+                self.vga_byte(byte);
+                accepted += 1;
+                continue;
+            }
+            // Boot and the isolated userspace test have no shell queue. A
+            // missing/unresponsive UART produces a real error, not success.
+            if (byte == b'\n' && !self.serial_byte_bounded(b'\r'))
+                || !self.serial_byte_bounded(byte)
+            {
+                return if accepted == 0 { Err(()) } else { Ok(accepted) };
+            }
+            self.vga_byte(byte);
+            accepted += 1;
+        }
+        Ok(accepted)
+    }
+
     fn vga_byte(&mut self, byte: u8) {
         match byte {
             b'\n' => self.newline(),
@@ -207,21 +237,26 @@ impl Console {
     }
 
     fn serial_byte(&mut self, byte: u8) {
+        self.serial_byte_bounded(byte);
+    }
+
+    fn serial_byte_bounded(&mut self, byte: u8) -> bool {
         // Bound the wait so a missing or faulty UART cannot freeze VGA output.
         for _ in 0..100_000 {
             let status = self.serial_status();
             if status == 0xff {
-                return; // Missing COM1 must not delay every boot/VGA byte.
+                return false; // Missing COM1 must not delay every boot/VGA byte.
             }
             if status & 0x20 != 0 {
                 // SAFETY: the UART transmit holding register is ready.
                 unsafe {
                     outb(COM1, byte);
                 }
-                return;
+                return true;
             }
             core::hint::spin_loop();
         }
+        false
     }
 }
 

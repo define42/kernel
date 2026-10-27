@@ -12,6 +12,8 @@ fn main() {
         "userspace/fuzz.rs",
         "userspace/syscall.rs",
         "userspace/http.rs",
+        "userspace/heap.rs",
+        "userspace/heap_test.rs",
         "userspace/linker.ld",
         "userspace/netd.rs",
         "userspace/arp_announce.rs",
@@ -55,6 +57,16 @@ fn main() {
     }
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    if env::var_os("CARGO_FEATURE_STD_TEST").is_some() {
+        println!("cargo:rerun-if-env-changed=KERNEL_STD_ELF");
+        let image = env::var_os("KERNEL_STD_ELF")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("build/std/std-demo.elf"));
+        println!("cargo:rerun-if-changed={}", image.display());
+        std::fs::copy(&image, output.join("webserver.elf"))
+            .expect("build the userspace std ELF first with make std-demo");
+        return;
+    }
     let mut compiler = Command::new(env::var_os("RUSTC").unwrap());
     compiler
         .arg(root.join("userspace/main.rs"))

@@ -11,6 +11,7 @@ use core::ptr::{
 };
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::abi::{USER_HEAP_BASE, USER_HEAP_END, USER_HEAP_SIZE};
 use crate::arch::Context;
 
 pub const USER_BASE: u64 = 0x4000_0000;
@@ -30,7 +31,10 @@ pub const DEVICE_DMA: u64 = 0x5020_0000;
     allow(dead_code)
 )]
 const MMIO_LENGTH: usize = 128 * 1024;
-const STACK_GUARD: u64 = STACK_BOTTOM - PAGE_SIZE as u64;
+const IMAGE_END: u64 = USER_HEAP_BASE - PAGE_SIZE as u64;
+const _: () = assert!(USER_HEAP_BASE.is_multiple_of(PAGE_SIZE as u64));
+const _: () = assert!(USER_HEAP_SIZE.is_multiple_of(PAGE_SIZE));
+const _: () = assert!(USER_HEAP_END + PAGE_SIZE as u64 <= STACK_BOTTOM - PAGE_SIZE as u64);
 const REGION_SIZE: usize = (USER_END - USER_BASE) as usize;
 const PAGE_SIZE: usize = 4096;
 const PAGE_COUNT: usize = REGION_SIZE / PAGE_SIZE;
@@ -240,7 +244,8 @@ impl Process {
         }
     }
 
-    /// Restore initialized data, clear BSS and stack, and reset all registers.
+    /// Restore initialized data, clear BSS, heap and stack, and reset all registers.
+    /// Heap contents and userspace allocator metadata never survive a restart.
     /// Device mappings and the currently selected CR3 are not changed.
     pub fn restart(&mut self, arg: u64) {
         let backing = self.backing();
@@ -516,6 +521,16 @@ impl Process {
                     );
                 }
             }
+            // The heap is backed by this slot's existing private RAM. It is
+            // always RW/NX; guards and all unused image/stack gaps stay absent.
+            for page in ((USER_HEAP_BASE - USER_BASE) as usize / PAGE_SIZE)
+                ..((USER_HEAP_END - USER_BASE) as usize / PAGE_SIZE)
+            {
+                write_volatile(
+                    table.add(page),
+                    (backing + (page * PAGE_SIZE) as u64) | PRESENT | USER | WRITABLE | NO_EXECUTE,
+                );
+            }
             for page in ((STACK_BOTTOM - USER_BASE) as usize / PAGE_SIZE)..PAGE_COUNT {
                 write_volatile(
                     table.add(page),
@@ -669,7 +684,13 @@ pub(crate) fn allowed_user_page(
     // SAFETY: only the kernel modifies metadata, with user execution stopped.
     unsafe {
         if (USER_BASE..USER_END).contains(&address) {
-            return physical == addr_of!((*store).backing) as u64 + address - USER_BASE;
+            let private = physical == addr_of!((*store).backing) as u64 + address - USER_BASE;
+            let image = (USER_BASE..IMAGE_END).contains(&address);
+            let writable_data = (USER_HEAP_BASE..USER_HEAP_END).contains(&address)
+                || (STACK_BOTTOM..USER_END).contains(&address);
+            // In particular, no guard or unused gap may become a user page,
+            // and heap/stack permissions cannot be weakened to executable.
+            return private && (image || (writable_data && writable && !executable));
         }
         if slot % SERVICES_PER_INTERFACE != DRIVER_SLOT || !writable || executable {
             return false;
@@ -699,6 +720,7 @@ pub fn check_isolation(web: &mut Process, network: &mut Process, driver: &mut Pr
     let address = STACK_BOTTOM;
     let mut roots = [0; SERVICES_PER_INTERFACE];
     let mut physical = [0; SERVICES_PER_INTERFACE];
+    let mut heap_physical = [0; SERVICES_PER_INTERFACE];
     for (index, process) in processes.iter_mut().enumerate() {
         assert_eq!(
             process.slot,
@@ -713,6 +735,7 @@ pub fn check_isolation(web: &mut Process, network: &mut Process, driver: &mut Pr
         crate::memory::check_permissions();
         roots[index] = active_root();
         physical[index] = crate::memory::permissions(address).unwrap().physical;
+        heap_physical[index] = check_heap_mapping(process, 0x1234_9000 + index as u64);
         assert_eq!(
             crate::memory::permissions(DEVICE_MMIO).unwrap().user,
             index == DRIVER_SLOT
@@ -731,6 +754,10 @@ pub fn check_isolation(web: &mut Process, network: &mut Process, driver: &mut Pr
                 physical[first], physical[second],
                 "private user pages alias"
             );
+            assert_ne!(
+                heap_physical[first], heap_physical[second],
+                "private heap pages alias"
+            );
         }
     }
     // MOV RAX,[RDI]; INT80; UD2. The first pass reads each private virtual page;
@@ -743,6 +770,17 @@ pub fn check_isolation(web: &mut Process, network: &mut Process, driver: &mut Pr
         let other = physical[(index + 1) % SERVICES_PER_INTERFACE];
         let context = run_isolation_probe(process, READ, other);
         assert_eq!(context.vector, 14, "cross-process physical read must fault");
+        assert_eq!(context.error_code & 5, 5);
+        assert_eq!(context.cr2, other);
+        let context = run_isolation_probe(process, READ, USER_HEAP_BASE);
+        assert_eq!(context.vector, 128);
+        assert_eq!(context.rax, 0x1234_9000 + index as u64);
+        let other = heap_physical[(index + 1) % SERVICES_PER_INTERFACE];
+        let context = run_isolation_probe(process, READ, other);
+        assert_eq!(
+            context.vector, 14,
+            "cross-process physical heap read must fault"
+        );
         assert_eq!(context.error_code & 5, 5);
         assert_eq!(context.cr2, other);
     }
@@ -803,7 +841,7 @@ pub fn check_isolation(web: &mut Process, network: &mut Process, driver: &mut Pr
     let context = run_isolation_probe(processes[0], &[0xc5, 0xf8, 0x77, 0xcd, 0x80], 0);
     assert_eq!(context.vector, 6, "AVX must remain unavailable");
     for process in processes {
-        process.restart(0);
+        check_heap_reset(process);
     }
     activate_kernel();
     crate::memory::check_permissions();
@@ -858,6 +896,7 @@ pub unsafe fn check_interface_isolation(
     }
     let mut roots = [0; COUNT];
     let mut physical = [0; COUNT];
+    let mut heap_physical = [0; COUNT];
     for (index, process) in processes.iter_mut().enumerate() {
         let group = index / SERVICES_PER_INTERFACE;
         let role = index % SERVICES_PER_INTERFACE;
@@ -870,6 +909,7 @@ pub unsafe fn check_interface_isolation(
         crate::memory::check_permissions();
         roots[index] = active_root();
         physical[index] = crate::memory::permissions(STACK_BOTTOM).unwrap().physical;
+        heap_physical[index] = check_heap_mapping(process, 0x8765_9000 + index as u64);
         for (kind, address) in [DEVICE_MMIO, DEVICE_DMA].into_iter().enumerate() {
             let mapping = crate::memory::permissions(address).unwrap();
             assert_eq!(mapping.user, role == DRIVER_SLOT);
@@ -885,6 +925,10 @@ pub unsafe fn check_interface_isolation(
         for second in first + 1..COUNT {
             assert_ne!(roots[first], roots[second], "NIC process roots alias");
             assert_ne!(physical[first], physical[second], "NIC private pages alias");
+            assert_ne!(
+                heap_physical[first], heap_physical[second],
+                "NIC private heap pages alias"
+            );
         }
     }
     let mut saved_dma = [0u64; 2];
@@ -903,6 +947,9 @@ pub unsafe fn check_interface_isolation(
         let context = run_isolation_probe(process, READ, STACK_BOTTOM);
         assert_eq!(context.vector, 128);
         assert_eq!(context.rax, 0x8765_4321 + index as u64);
+        let context = run_isolation_probe(process, READ, USER_HEAP_BASE);
+        assert_eq!(context.vector, 128);
+        assert_eq!(context.rax, 0x8765_9000 + index as u64);
         if index % SERVICES_PER_INTERFACE == DRIVER_SLOT {
             let context = run_isolation_probe(process, READ, DEVICE_DMA);
             assert_eq!(context.vector, 128);
@@ -917,6 +964,7 @@ pub unsafe fn check_interface_isolation(
         }
         for address in [
             physical[peer * SERVICES_PER_INTERFACE + index % SERVICES_PER_INTERFACE],
+            heap_physical[peer * SERVICES_PER_INTERFACE + index % SERVICES_PER_INTERFACE],
             resources[peer][0].physical,
             resources[peer][1].physical,
         ] {
@@ -944,7 +992,7 @@ pub unsafe fn check_interface_isolation(
         unsafe { write_volatile(resources[group][1].physical as *mut u64, saved) };
     }
     for process in processes {
-        process.restart(0);
+        check_heap_reset(process);
     }
     activate_kernel();
     crate::memory::check_permissions();
@@ -979,6 +1027,61 @@ pub unsafe fn check_device_unmapping(driver: &mut Process) {
     driver.restart(0);
     activate_kernel();
     crate::memory::check_permissions();
+}
+
+/// Check every heap leaf, checked-copy boundary, and both guards while this
+/// process is active; seed distinct words for the subsequent real CPL3 probes.
+#[cfg(feature = "isolation-test")]
+fn check_heap_mapping(process: &mut Process, pattern: u64) -> u64 {
+    let expected = process.backing() as u64 + USER_HEAP_BASE - USER_BASE;
+    for offset in (0..USER_HEAP_SIZE).step_by(PAGE_SIZE) {
+        let mapping = crate::memory::permissions(USER_HEAP_BASE + offset as u64)
+            .expect("private heap page is unmapped");
+        assert_eq!(mapping.physical, expected + offset as u64);
+        assert!(mapping.user && mapping.writable && !mapping.executable);
+    }
+    assert!(process.validate_buffer(USER_HEAP_BASE, USER_HEAP_SIZE, false));
+    assert!(process.validate_buffer(USER_HEAP_BASE, USER_HEAP_SIZE, true));
+    assert!(!process.validate_buffer(USER_HEAP_BASE - 1, 2, false));
+    assert!(!process.validate_buffer(USER_HEAP_END - 1, 2, true));
+    for address in [IMAGE_END, USER_HEAP_BASE - 1, USER_HEAP_END] {
+        assert!(crate::memory::permissions(address).is_none());
+        assert!(!process.validate_buffer(address, 1, false));
+        assert!(!process.validate_buffer(address, 1, true));
+        assert!(process.copy_from_user(address, &mut [0]).is_err());
+        assert!(process.copy_to_user(address, &[0]).is_err());
+    }
+    for address in (USER_HEAP_END..STACK_BOTTOM).step_by(PAGE_SIZE) {
+        assert!(crate::memory::permissions(address).is_none());
+    }
+    for address in [USER_HEAP_BASE, USER_HEAP_END - 8] {
+        let mut actual = [0; 8];
+        process.copy_from_user(address, &mut actual).unwrap();
+        assert_eq!(actual, [0; 8], "heap retains data after restart");
+        process
+            .copy_to_user(address, &pattern.to_le_bytes())
+            .unwrap();
+        process.copy_from_user(address, &mut actual).unwrap();
+        assert_eq!(actual, pattern.to_le_bytes());
+    }
+    expected
+}
+
+/// Fill the entire arena before restarting, so zeroing the whole allocation
+/// is checked independently of the allocator's own metadata and free lists.
+#[cfg(feature = "isolation-test")]
+fn check_heap_reset(process: &mut Process) {
+    // SAFETY: this stopped process exclusively owns its private backing. The
+    // fixed heap is entirely inside it, and the kernel alias stays resident.
+    let heap = unsafe { process.backing().add((USER_HEAP_BASE - USER_BASE) as usize) };
+    unsafe { write_bytes(heap, 0xa5, USER_HEAP_SIZE) };
+    process.restart(0);
+    // SAFETY: restart does not change ownership or invalidate the backing.
+    let bytes = unsafe { core::slice::from_raw_parts(heap, USER_HEAP_SIZE) };
+    assert!(
+        bytes.iter().all(|&byte| byte == 0),
+        "restart did not clear the heap"
+    );
 }
 
 #[cfg(feature = "isolation-test")]
@@ -1128,7 +1231,7 @@ fn parse_elf(image: &[u8]) -> Result<(u64, [Segment; MAX_SEGMENTS], usize), &'st
         if file_size > memory_size || file_end > image.len() {
             return Err("ELF segment exceeds its backing image");
         }
-        if address < USER_BASE || memory_end > STACK_GUARD {
+        if !(USER_BASE..=IMAGE_END).contains(&address) || memory_end > IMAGE_END {
             return Err("ELF segment exceeds userspace image window");
         }
         if memory_size == 0 {

@@ -872,6 +872,46 @@ fn dispatch(
             0
         }
         abi::SYS_NOW => clock.now_millis(),
+        abi::SYS_RANDOM_BYTES => random_bytes(&mut tasks[slot].process, a, b, d),
+        abi::SYS_WRITE => {
+            if !matches!(a, 1 | 2) {
+                return abi::EBADF;
+            }
+            if d > abi::MAX_LOG as u64 {
+                return abi::EINVAL;
+            }
+            if d == 0 {
+                return 0;
+            }
+            let task = &mut tasks[slot];
+            let mut buffer = [0u8; abi::MAX_LOG];
+            // Validate/copy the whole request before either queue mutation or
+            // budget accounting, even when only a prefix could be accepted.
+            if task
+                .process
+                .copy_from_user(b, &mut buffer[..d as usize])
+                .is_err()
+            {
+                return abi::EFAULT;
+            }
+            let now = clock.now_millis();
+            if now - task.log_epoch >= 1000 {
+                task.log_epoch = now;
+                task.log_bytes = 0;
+            }
+            let length = (d as usize).min(4096usize.saturating_sub(task.log_bytes));
+            if length == 0 {
+                return abi::EAGAIN;
+            }
+            match console.write_user_bytes(&buffer[..length]) {
+                Ok(0) => abi::EAGAIN,
+                Ok(count) => {
+                    task.log_bytes += count;
+                    count as i64
+                }
+                Err(()) => abi::EIO,
+            }
+        }
         abi::SYS_LOG => {
             if b > abi::MAX_LOG as u64 {
                 return abi::EINVAL;
@@ -968,6 +1008,30 @@ fn dispatch(
         abi::SYS_FRAME_RECV..=abi::SYS_NET_CONFIG => abi::EACCES,
         _ => abi::ENOSYS,
     }
+}
+
+/// All roles receive only bounded random bytes, never additional NIC or DMA
+/// capabilities. The older SYS_RANDOM remains restricted to NETWORK above.
+fn random_bytes(process: &mut Process, address: u64, length: u64, reserved: u64) -> i64 {
+    if length > abi::MAX_RANDOM_BYTES as u64 || reserved != 0 {
+        return abi::EINVAL;
+    }
+    if length == 0 {
+        return 0;
+    }
+    if !process.validate_buffer(address, length as usize, true) {
+        return abi::EFAULT;
+    }
+    let mut bytes = [0; abi::MAX_RANDOM_BYTES];
+    for chunk in bytes[..length as usize].chunks_mut(8) {
+        let Some(value) = entropy::random_u64() else {
+            return abi::EIO;
+        };
+        chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
+    }
+    process
+        .copy_to_user(address, &bytes[..length as usize])
+        .map_or(abi::EFAULT, |_| length as i64)
 }
 
 struct Group<'a> {

@@ -9,6 +9,14 @@ import sys
 
 SUCCESS_MARKER = "Userspace isolation checks passed."
 SUCCESS_STATUS = (0x10 << 1) | 1
+REQUIRED_MARKERS = (
+    "Heap-backed Box/Vec/String and syscall buffer passed.",
+    "Userspace heap allocation, reuse, exhaustion, and guard checks passed.",
+    "Ring-3 probe 18: contained vector 14",
+    "Ring-3 probe 19: contained vector 14",
+    "Ring-3 probe 20: contained vector 14",
+    "Ring-3 probe 21: passed (exit 1)",
+)
 
 
 def positive_timeout(value: str) -> float:
@@ -72,13 +80,18 @@ def main() -> int:
         print(f"Unable to start QEMU ({args.qemu}): {error}", file=sys.stderr)
         return 1
 
-    if result.returncode != SUCCESS_STATUS or SUCCESS_MARKER not in result.stdout:
+    missing = [marker for marker in REQUIRED_MARKERS if marker not in result.stdout]
+    if result.stdout.count("Ring-3 probe 17: passed (exit 0)") != 2:
+        missing.append("heap allocation/recovery probe passed before and after OOM restart")
+    if result.returncode != SUCCESS_STATUS or SUCCESS_MARKER not in result.stdout or missing:
         print(
             f"QEMU boot failed: exit status {result.returncode} "
             f"(expected {SUCCESS_STATUS}); serial success marker "
             f"{'found' if SUCCESS_MARKER in result.stdout else 'missing'}.",
             file=sys.stderr,
         )
+        if missing:
+            print(f"Missing required checks: {missing}", file=sys.stderr)
         show_output(result.stdout, result.stderr)
         return 1
 

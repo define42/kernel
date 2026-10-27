@@ -6,6 +6,9 @@ use smoltcp::socket::tcp;
 
 use crate::{abi, console::Console, time::Clock, userspace::Process};
 
+#[path = "entropy.rs"]
+mod entropy;
+
 pub enum Action {
     Continue,
     Poll,
@@ -32,6 +35,28 @@ pub fn dispatch(
         abi::SYS_EXIT => {
             action = Action::Exit(a);
             0
+        }
+        abi::SYS_RANDOM_BYTES => random_bytes(process, a, b, c),
+        abi::SYS_WRITE => {
+            if !matches!(a, 1 | 2) {
+                abi::EBADF
+            } else if c > abi::MAX_LOG as u64 {
+                abi::EINVAL
+            } else if c == 0 {
+                0
+            } else {
+                let mut bytes = [0; abi::MAX_LOG];
+                let bytes = &mut bytes[..c as usize];
+                if process.copy_from_user(b, bytes).is_err() {
+                    abi::EFAULT
+                } else {
+                    match console.write_user_bytes(bytes) {
+                        Ok(0) => abi::EAGAIN,
+                        Ok(count) => count as i64,
+                        Err(()) => abi::EIO,
+                    }
+                }
+            }
         }
         abi::SYS_LOG => {
             if b > abi::MAX_LOG as u64 {
@@ -157,4 +182,28 @@ fn transfer(
             .send_slice(&scratch[..length])
             .map_or(abi::ENOTCONN, |n| n as i64)
     }
+}
+
+/// Generate into private scratch space so entropy failure cannot leave a
+/// partially initialized userspace destination that the caller might consume.
+fn random_bytes(process: &mut Process, address: u64, length: u64, reserved: u64) -> i64 {
+    if length > abi::MAX_RANDOM_BYTES as u64 || reserved != 0 {
+        return abi::EINVAL;
+    }
+    if length == 0 {
+        return 0;
+    }
+    if !process.validate_buffer(address, length as usize, true) {
+        return abi::EFAULT;
+    }
+    let mut bytes = [0; abi::MAX_RANDOM_BYTES];
+    for chunk in bytes[..length as usize].chunks_mut(8) {
+        let Some(value) = entropy::random_u64() else {
+            return abi::EIO;
+        };
+        chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
+    }
+    process
+        .copy_to_user(address, &bytes[..length as usize])
+        .map_or(abi::EFAULT, |_| length as i64)
 }

@@ -1,5 +1,11 @@
-//! The small, nonblocking socket ABI shared by the kernel and userspace.
+//! The fixed memory layout and small, nonblocking ABI shared by kernel and userspace.
 #![allow(dead_code)]
+
+/// Each process owns a private, zeroed RW/NX heap at the same virtual address.
+/// The kernel leaves one unmapped guard page immediately before and after it.
+pub const USER_HEAP_BASE: u64 = 0x4010_0000;
+pub const USER_HEAP_SIZE: usize = 512 * 1024;
+pub const USER_HEAP_END: u64 = USER_HEAP_BASE + USER_HEAP_SIZE as u64;
 
 pub const SYS_POLL: u64 = 0;
 pub const SYS_NOW: u64 = 1;
@@ -52,6 +58,16 @@ pub const SYS_RANDOM: u64 = 19;
 /// NETWORK only: copy the current canonical network configuration into exactly
 /// sixteen writable user bytes. The third argument must be zero.
 pub const SYS_NET_CONFIG: u64 = 20;
+/// All services: fill up to MAX_RANDOM_BYTES writable user bytes. Arguments are
+/// (pointer, length, 0). Returns length; zero length ignores the pointer. Failed
+/// entropy generation leaves the complete destination unchanged.
+pub const SYS_RANDOM_BYTES: u64 = 21;
+pub const MAX_RANDOM_BYTES: usize = 256;
+/// All services: write up to MAX_LOG bytes to stdout (fd 1) or stderr (fd 2).
+/// Arguments are (fd, pointer, length); returns the accepted input byte count.
+/// Raw bytes are preserved, with terminal LF -> CRLF and visible fragment
+/// boundaries for bounded shell fairness. EAGAIN means nothing was accepted.
+pub const SYS_WRITE: u64 = 22;
 pub const NET_CONFIG_SIZE: usize = 16;
 /// Physical kernel text used only by privilege/DMA regression probes.
 /// Keep in sync with the fixed load address in linker.ld.

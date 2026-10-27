@@ -2,9 +2,12 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 #[path = "../abi.rs"]
 mod abi;
 mod e1000;
+mod heap;
 #[allow(dead_code)]
 mod syscall;
 
@@ -18,6 +21,12 @@ const MAC_REGISTER: u64 = 18;
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
 pub extern "C" fn _start(mmio: u64, dma: u64, iova: u64, mode: u64, probe: u64, mac: u64) -> ! {
+    // SAFETY: the loader supplies a fresh private heap and allocator state on
+    // every entry. This process has not allocated or started any user threads.
+    assert!(
+        unsafe { heap::init() },
+        "userspace heap initialization failed"
+    );
     let cs: u16;
     // SAFETY: reading CS is unprivileged.
     unsafe {

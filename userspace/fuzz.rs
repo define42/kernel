@@ -3,7 +3,7 @@ use crate::{abi, syscall};
 
 pub fn run(seed: u64, iterations: u64) -> ! {
     let mut random = seed.max(1);
-    let mut buffer = [0xa5u8; 96];
+    let mut buffer = alloc::boxed::Box::new([0xa5u8; 96]);
     let address = buffer[16..80].as_mut_ptr() as u64;
     for index in 0..iterations {
         random ^= random << 13;
@@ -15,7 +15,8 @@ pub fn run(seed: u64, iterations: u64) -> ! {
             0,
             0x100000,
             0xfed00000,
-            0x40100000,
+            abi::USER_HEAP_BASE - 4096,
+            abi::USER_HEAP_END,
             0x401effff,
             0x40200000,
             0x0000800000000000,

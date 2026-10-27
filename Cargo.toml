@@ -10,6 +10,7 @@ smoltcp = { optional = true, version = "=0.14.0", default-features = false, feat
 [features]
 smoke-test = []
 userspace-test = ["dep:smoltcp"]
+std-test = ["userspace-test"]
 preemption-test = []
 fuzz-test = []
 isolation-test = []

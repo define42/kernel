@@ -300,3 +300,118 @@ require administrator updates. Previous artifact hashes identify earlier builds.
 | `build/kernel.bin` | `4f158968f5fc4be58a4d24ef9aa9fcafa72b75262017b426a47f9c80f1490ada` |
 | `build/baremetal/kernel.bin` | `3951ba01b5abcc8602aa264e5bf882439dd7e2bafa79496c6c45b15f226e1284` |
 | `build/baremetal/kernel.iso` | `6d9dd9c23e07fbd4a0af6b9e8675c5ca21bc3cbde2aa12a37c3ad5a75ee03dac` |
+
+
+## Userspace heap follow-up — 2026-10-27
+
+Added a private fixed 512 KiB RW/NX heap to every ring-3 process, using its
+existing backing. ELF bounds reserve the lower guard; heap guards and the gap
+before the stack remain unmapped. A userspace global allocator supports aligned
+allocation, reuse/coalescing, zeroed allocation, and shrinking/growing/moving
+reallocation. All three service entry points initialize it. The webserver's
+bounded connection array and syscall-fuzz buffer now use `Box`.
+
+Validated with stable rustc 1.95.0 (59807616e 2026-04-14):
+
+- `make kernel`, `make test-host`, and `make check` passed, including all checked
+  feature combinations and standalone userspace Clippy builds. The 13 allocator
+  host tests cover exhaustion, full recovery, alignments through 64 KiB,
+  fragmentation, canaries, zeroing, realloc preservation/failure, independent
+  arenas, 30,000 seeded operations, and eight concurrent host workers. The focused
+  allocator suite also passed in release mode.
+- `make test-userspace` passed on both `qemu64` and `max`. Real CPL3 probes check
+  `Box`/`Vec`/`String`, heap-backed syscall copies, alignment, zeroing, complete
+  heap exhaustion/reuse, and rejected copies crossing guard boundaries. Both
+  guard pages fault and heap execution faults with NX. An intentional 524,289-byte
+  infallible allocation reaches the process panic handler and exits with code 1;
+  repeating the allocation probe after restart succeeds with cleared memory.
+- The first exhaustion probe exposed allocation-shim optimization: a raw
+  `alloc::alloc` call used only for its null result was eliminated and assumed
+  successful. That deterministic accounting assertion now calls `GlobalAlloc`
+  directly; ordinary collection and fallible-reservation paths remain tested.
+- `make test-http test-multi-nic` passed. Both NICs served HTTP and echo, and eth1
+  reconfiguration/down/up preserved eth0's held stream through 105 HTTP checks.
+- `make test-services test-multi-nic-isolation` passed. Heap checks audit every
+  page, prove private physical backing, fault on peer physical aliases, verify
+  checked copies, and fill/clear the entire arena on restart. Service recovery
+  completed 172 of 175 echo exchanges across intentional faults; the peer NIC's
+  held stream and HTTP survived 123 cross-NIC isolation/recovery rounds.
+- `make test-preemption` passed with 100 echo sessions during a busy user loop
+  and 50 during syscall load.
+- `make fuzz-syscalls FUZZ_SEED=67 FUZZ_ITERATIONS=100000` passed with 100,002
+  calls and 229 preemptions using the heap-backed mutation buffer. Artifacts:
+  `build/fuzz/syscalls-1793134897893442761`.
+
+These are host and emulator checks. No physical machine, new hardware image,
+long-duration network fuzz campaign, or independent security audit was included
+in this follow-up. The heap is bounded, can fragment, and does not provide a
+kernel allocator, heap growth, Rust `std`, or an Actix/Axum runtime port.
+
+| Artifact after userspace heap | SHA-256 |
+| --- | --- |
+| `build/kernel.bin` | `bdfb2a8714e6a750469bfac8e0f9c01e12ec46a33b04501df8346a004f181ae4` |
+| `build/webserver.elf` | `d92414eb4058564b9ee17c14bd8d7b2278420dea3aed6d170a226306526f68a9` |
+| `build/netd.elf` | `3b3ee7f1273fbf4a362673cb951de46078fb06e62d557ce17e6056b7237c68c5` |
+| `build/nic-driver.elf` | `be8435e0494891f3d4c329d97bcbea514ce9ea846227d00a2dc752d4bfb33ef8` |
+
+
+## Initial userspace Rust std port — 2026-10-27
+
+Added a backend for the real upstream Rust standard library on the custom
+`x86_64-unknown-kernel` target, with ordinary Rust `fn main()` startup in ring 3.
+The repository-local compiler is pinned to `nightly-2026-04-15`, reporting
+`rustc 1.97.0-nightly (a5c825cd8 2026-04-14)`. The kernel and existing services
+continue to use stable rustc 1.95.0. Thirteen upstream dispatch files are hash
+checked before patching and nine platform files are overlaid; the shared rustup
+installation is not patched.
+
+Validation performed:
+
+- `make test-std check-std` passed. The normal QEMU `max` CPU run executes the
+  real std binary in CPL3, checking `Vec`, `String`, `HashMap`, fallible allocation,
+  direct `System` allocation, stdout/stderr, `Instant`, yielding sleep, const/lazy
+  TLS, `Mutex`, `OnceLock`, and park-token consumption. Unsupported stdin,
+  filesystem, TCP listener, child-process, and thread-creation operations report
+  `Unsupported` through fallible APIs.
+- Kernel WP/NX fault probes, RX code, every RW/NX heap page, both heap guards,
+  bounded random/output syscall arguments, timer progress, and full heap clearing
+  are checked. Intentional panic and 524,289-byte allocation failure exit with
+  status 1; explicit exit preserves status 7. The complete ordinary program
+  succeeds again after restart with cleared TLS and initialization state.
+- The second `test-std` boot disables both RDRAND and RDSEED. Random-byte failure
+  leaves the caller's sentinel buffer unchanged. HashMap seeding aborts rather
+  than falling back to predictable keys, both before and after process restart.
+- All three source-patch integrity tests passed. They check successful patching,
+  source-hash mismatch, and preexisting overlays without partial mutation.
+  `make -j2 setup-std std-demo` passed with serialized private-source preparation
+  and compilation. Pristine backups and published ELF files use atomic renames.
+- `make kernel test-host`, `make check`, and Python syntax checks passed. Host
+  regressions include all 13 allocator tests and seven new strict serial-queue
+  cases covering backpressure, CRLF capacity, invalid UTF-8/NUL, fragment
+  boundaries, ring wrap, and interaction with legacy log truncation/overflow.
+- `make test-userspace` passed on `qemu64` and `max`. `make test-http test-serial`
+  passed, including 295 concurrent HTTP checks during serial administration,
+  reconnects, live NIC reconfiguration, and refusal without an IOMMU.
+- `make test-services` passed in the normal service architecture. Its web process
+  now exercises positive and rejected random-byte/stdout calls, read-only and
+  guard-crossing ranges, unchanged canaries, and preserved capability checks.
+  Recovery completed 172 of 176 echo exchanges across intentional faults, with
+  three successful exchanges after all containment checks. Missing-IOMMU and
+  APIC-present development boots still refuse device assignment.
+
+ELF inspection finds three load segments (RX, R, RW) and entry `0x40000000`;
+loaded image memory ends at `0x40018000`, below the reserved heap guard. The
+heap remains fixed at 512 KiB. The std regression image uses the separate legacy
+userspace harness; it is not an Axum/Actix webserver or the normal VT-d service
+image. Normal-service syscall handling is covered separately as described above.
+
+No physical-machine test, long-duration network fuzz campaign, independent
+security audit, or production qualification was performed for this port.
+Sockets/filesystems, user threads, wall-clock time, and Tokio remain unsupported;
+single-thread TLS/synchronization assumptions and omitted TLS destructors are
+explicitly documented in `userspace/std-port/README.md`.
+
+| Artifact after std port | SHA-256 |
+| --- | --- |
+| `build/std/std-demo.elf` | `c6c2c70bed69f32a616015f1cd6245c2cb0b90b5978343f06afb1c245b590e52` |
+| `build/std-test/kernel.bin` | `7425317f9e3ca615b200377a6abcf001258ced09a847c5b03f48feebb80eb627` |

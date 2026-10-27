@@ -7,6 +7,9 @@ an allocation-free [smoltcp](https://docs.rs/smoltcp/0.14.0/smoltcp/) network
 service, and an Intel e1000 driver. The kernel provides address spaces,
 preemption, checked IPC, and a narrow VT-d device-assignment boundary.
 Ethernet packet handling, TCP/IP, and HTTP run outside ring 0.
+An optional, separate userspace target ports a limited subset of real Rust `std`
+using a repository-local pinned nightly; the normal kernel and services remain
+stable Rust `no_std` builds.
 
 The default target is **q35, one CPU, an e1000 on PCI root bus 0, and QEMU's
 Intel IOMMU**. The separate [hardware port](docs/HARDWARE.md) adds UEFI/GRUB
@@ -87,7 +90,7 @@ restarts can reset existing connections.
 
 ## Services and IPC
 
-Each service instance has its own CR3, physical backing, ELF image, stack, and
+Each service instance has its own CR3, physical backing, ELF image, stack, heap, and
 saved extended CPU state. Each NIC receives a separate group of driver, network,
 and web services. Their common virtual entry address does not imply shared
 memory. The following diagram shows one group; IPC never crosses groups.
@@ -141,12 +144,113 @@ passing another handle or syscall number cannot select another service's role.
 | 17 | MAC | Network service; read the driver-registered packed MAC |
 | 18 | Register MAC | NIC driver; publish a validated unicast MAC |
 | 19 | Random | Network service; fill exactly eight writable private bytes; hardware failure is an error |
+| 20 | Network configuration | Network service; copy the current validated configuration |
+| 21 | Random bytes | All services; at most 256 writable private bytes; entropy failure leaves the destination unchanged |
+| 22 | Standard output/error | All services; descriptor 1 or 2, at most 512 input bytes; partial writes or `EAGAIN`, sharing the log budget |
+
+## Userspace heap
+
+Every webserver, network service, and driver initializes a private **512 KiB**
+heap at startup, including after a service restart. `userspace/heap.rs` provides
+Rust's global allocator, so `extern crate alloc` enables `Box`, `Vec`, `String`,
+and other `alloc` collections in these `no_std` programs. The webserver's four
+connection objects now live on this heap; their buffer sizes and connection
+limits remain bounded.
+
+The allocator uses aligned first-fit allocation with a 16-byte minimum block,
+returns freed blocks to an address-ordered free list, and merges adjacent free
+blocks. It supports zeroed allocation and reallocation; failed reallocation
+preserves the old block. Use fallible reservation for requests that may exceed
+the budget:
+
+```rust
+extern crate alloc;
+use alloc::vec::Vec;
+
+let mut buffer = Vec::<u8>::new();
+buffer.try_reserve_exact(4096)?;
+buffer.resize(4096, 0);
+```
+
+`try_reserve` / `try_reserve_exact` report exhaustion. Infallible allocations
+such as `Box::new` and `Vec::with_capacity` terminate the process through its
+panic/exit handler on exhaustion. The service supervisor's existing restart
+limits still apply. Allocator operations do not log, allocate recursively, or
+make syscalls. Each allocator has its own lock and metadata in private process
+memory; timer preemption can switch to another process with a separate heap.
+
+The fixed heap occupies `0x40100000..0x40180000` (end exclusive), is writable
+and non-executable, and has a 4 KiB unmapped guard on each side. ELF segments
+must end by `0x400ff000`. The existing process backing supplies these pages, so
+this change does not enlarge the kernel's reserved physical memory. A restart
+zeros the entire heap and resets allocator metadata. Freed memory within a live
+process is not scrubbed unless zeroed allocation is requested. Guard pages
+protect the arena boundary; they do not detect overflows between allocations.
+
+There is no heap growth, `mmap`/`brk`, or kernel allocator. The optional `std`
+port below uses the same fixed userspace allocator.
+Fragmentation and alignment can cause allocation failure before all 512 KiB is
+used. The heap supplies one prerequisite for larger Rust services; Actix/Axum
+still require additional OS and runtime support. Run `make test-host` for
+allocator regressions, `make test-userspace` for real ring-3 allocation/OOM and
+permission probes, and `make test-services test-multi-nic-isolation` for private
+heap isolation and restart checks with the normal service architecture.
+
+## Userspace Rust standard library
+
+The optional `x86_64-unknown-kernel` target builds upstream Rust `std` with a
+small platform backend and a process startup runtime. It supports `Box`, `Vec`,
+`String`, `HashMap`, formatting, stdout/stderr, monotonic `Instant`, yielding
+sleep, thread-local state, `Mutex`, and `OnceLock`. Each process still has one
+user thread and a fixed 512 KiB private heap. HashMap seeding requires hardware
+entropy; failure aborts the caller instead of using predictable fallback keys.
+
+```sh
+make setup-std    # Install the private compiler and prepare patched std sources.
+make std-demo     # Build an ordinary Rust fn main() using the real std library.
+make std-kernel   # Embed the demo in a separate kernel regression image.
+make test-std     # Boot that image in QEMU and check the runtime and failure paths.
+make check-std    # Run the std-specific build, formatting, and lint checks.
+```
+
+The first std build downloads `nightly-2026-04-15` and its Rust sources into
+`target/std-toolchain/`; these targets currently require an x86-64 Linux build
+host. This does not change the default rustup toolchain or patch
+a shared installation. The port checks upstream source hashes before applying
+its overlays. Normal `make run` continues to build the existing three services
+with stable Rust; it does not replace the HTTP server with the std demo.
+
+| Artifact | Purpose |
+| --- | --- |
+| `build/std/std-demo.elf` | Ring-3 executable linked with the ported standard library |
+| `build/std/toolchain.json` | Pinned compiler identity, port fingerprint, and ELF hash |
+| `build/std-test/kernel.bin` | Bootable regression image embedding the demo |
+
+The demo source is `userspace/std-demo/src/main.rs`. The `std-test` image uses
+the separate legacy userspace test harness, not the normal service/VT-d test.
+It exercises ordinary Rust containers and runtime facilities, syscall buffer
+boundaries, process exits, panic/OOM containment, and reset of private state.
+
+Standard output is terminal output through COM1: writes are bounded, can be
+partial, and return `WouldBlock` under queue or rate pressure. Newlines receive
+terminal conversion and long fragments may receive visible framing. This is not
+a transparent binary stream. Applications should handle backpressure and yield;
+`println!` panics if output fails. Serial command input remains owned by the
+kernel console, so nonempty stdin reads return `Unsupported`.
+
+`std::net`, filesystem access, child-process spawning, and user-thread creation
+remain unsupported. `SystemTime::now` panics because no wall clock is exposed;
+arguments/environment are empty and TLS destructors do not run at process exit.
+There is no Tokio runtime or Axum/Actix integration. Those need socket APIs,
+readiness/deadline waiting, and further runtime work. See the
+[std port contract and limitations](userspace/std-port/README.md).
 
 ## CPU, memory, and scheduling
 
 Each ELF occupies a private 2 MiB virtual window beginning at `0x40000000`,
-with a 64 KiB stack. Code is RX, constants are R/NX, and data and stacks are
-RW/NX. A guard page below each user stack is unmapped. Kernel memory, page
+with a 64 KiB stack and a 512 KiB heap. Code is RX, constants are R/NX, and
+data, stacks, and heaps are RW/NX. The pages immediately below and above
+each heap, and below each user stack, are unmapped. Kernel memory, page
 tables, trap stacks, and the other processes' physical backing remain
 supervisor-only. Only the driver receives the extra MMIO and DMA mappings.
 
@@ -291,6 +395,9 @@ non-cryptographic, so this does not establish secure TCP sequence generation.
 | `make fuzz-http` / `make fuzz-tcp` | HTTP / raw TCP/IP mutations in a private QEMU network |
 | `make fuzz-syscalls` | Seeded ring-3 calls against the production IPC broker |
 | `make check` | Formatting and Clippy checks |
+| `make setup-std` / `make std-demo` | Prepare the private pinned std toolchain / build the ring-3 demo ELF |
+| `make std-kernel` / `make test-std` | Build the separate std regression kernel / boot its QEMU checks |
+| `make check-std` | Build and check the optional userspace std port |
 | `make debug` | Boot paused; GDB on `127.0.0.1:1234` |
 | `make clean` | Remove generated files |
 
@@ -307,7 +414,8 @@ of hardware isolation or VM host security.
 The `userspace-test` feature is a deliberately separate baseline using the old
 ring-0 e1000/stack path. It checks kernel WP/NX, real CPL, invalid syscalls and
 buffers, forbidden memory and I/O access, stack/code permissions, privileged
-instructions, direction flags, and invalid return stacks on `qemu64` and `max`.
+instructions, direction flags, invalid return stacks, userspace allocation/exhaustion,
+heap guard/NX faults, and OOM recovery on `qemu64` and `max`.
 Only this feature compiles `src/legacy_net.rs`, `src/e1000.rs`, and the old socket
 syscall implementation. It is not the production service/DMA test. The
 `fuzz-test` feature uses the new production broker.
@@ -425,7 +533,10 @@ into a separate group for each assigned NIC;
 | `src/net.rs` | Production service scheduler, capabilities, opaque frame queues, RPC broker, recovery |
 | `src/device.rs`, `src/pci.rs` | Narrow PCI assignment, private DMA lifetime, controlled reset/bus mastering |
 | `src/iommu.rs` | VT-d DMA/interrupt tables, faults, grant/revoke, strict hardware guards |
-| `src/userspace.rs` | ELF loading, separate CR3 roots, checked copies, FXSAVE64 process state |
+| `src/userspace.rs` | ELF loading, separate CR3 roots, heap/stack mappings, checked copies, FXSAVE64 process state |
+| `userspace/heap.rs`, `userspace/heap_test.rs` | Private global allocator and ring-3 allocation/OOM probes |
+| `userspace/std-port/`, `userspace/std-runtime/`, `userspace/std-demo/` | Upstream std overlays, process startup/allocator exports, ordinary Rust demo |
+| `scripts/build_std.py`, `src/std_test.rs`, `scripts/std_test.py` | Private pinned toolchain build and isolated QEMU std regression image |
 | `src/memory.rs` | Kernel page permissions, stack guards, page-table audits |
 | `src/arch.rs`, `src/traps.S` | GDT/TSS/IDT, traps, IRQs, ring transitions |
 | `src/platform.rs`, `src/time.rs`, `src/timer.rs` | Validated firmware discovery, HPET clock, PIT/APIC preemption |
@@ -444,7 +555,7 @@ into a separate group for each assigned NIC;
 | `linker.ld`, `.cargo/config.toml`, `build.rs`, `Makefile` | Kernel layout, target flags, service embedding, build/run/test commands |
 | `scripts/smoke_test.py` | Bounded bootstrap checks |
 
-The project has no heap allocator, filesystem, keyboard input, general process
+The project has no kernel heap allocator, filesystem, keyboard input, general process
 launcher, or SMP support. UEFI boot is provided through GRUB/Multiboot2.
 Networking is polled, so an idle guest
 uses CPU time. CPU protection, the fixed DMA boundary, bounded IPC, quotas, and

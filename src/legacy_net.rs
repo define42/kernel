@@ -218,10 +218,16 @@ pub fn run(console: &mut Console) -> ! {
         "Userspace: isolated RX/R/RW pages, NX stack, guarded stack"
     )
     .ok();
-    #[cfg(feature = "fuzz-test")]
+    #[cfg(all(feature = "fuzz-test", not(feature = "std-test")))]
     crate::user_test::fuzz_run(&mut process, &mut sockets, &http_handles, &clock, console);
-    #[cfg(all(feature = "userspace-test", not(feature = "fuzz-test")))]
+    #[cfg(all(
+        feature = "userspace-test",
+        not(any(feature = "fuzz-test", feature = "std-test"))
+    ))]
     crate::user_test::run(&mut process, &mut sockets, &http_handles, &clock, console);
+
+    #[cfg(feature = "std-test")]
+    crate::std_test::run(&mut process, &mut sockets, &http_handles, &clock, console);
 
     #[cfg(not(any(feature = "userspace-test", feature = "fuzz-test")))]
     run_process(

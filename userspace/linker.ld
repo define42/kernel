@@ -47,5 +47,7 @@ SECTIONS
     }
 
     ASSERT(_start == 0x40000000, "Userspace entry must be at the image base")
+    /* Keep in sync with abi::USER_HEAP_BASE; the preceding page is unmapped. */
+    ASSERT(__image_end <= 0x400ff000, "Userspace image overlaps the heap guard")
     ASSERT(__image_end < 0x401ef000, "Userspace image overlaps the stack guard")
 }

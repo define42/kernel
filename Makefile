@@ -155,6 +155,7 @@ help:
 	@printf '%s\n' \
 	  'make           Build build/kernel.bin and the ELF with debug symbols' \
 	  'make setup     Install the Rust bare-metal target' \
+	  'make test-std  Build the native userspace std port and test it in QEMU' \
 	  'make run       Boot QEMU in this terminal (Ctrl-a x to exit)' \
 	  'make run-gui   Boot QEMU with a VGA window and serial console' \
 	  'make run-serial  Boot with COM1 on localhost:4444 (SERIAL_PORT overrides)' \
@@ -287,3 +288,25 @@ test-multi-nic-shared-failure:
 	@mkdir -p build/shared-failure-test
 	$(OBJCOPY) -O binary target/shared-failure-test/$(TARGET)/release/kernel build/shared-failure-test/kernel.bin
 	$(PYTHON) scripts/multi_nic_isolation_test.py "$(QEMU)" build/shared-failure-test/kernel.bin --shared-failure
+
+# A real std sysroot port, isolated from the normal stable no_std build.
+.PHONY: setup-std std-demo std-kernel test-std check-std
+setup-std:
+	$(PYTHON) scripts/build_std.py --setup-only
+
+std-demo:
+	$(PYTHON) scripts/build_std.py
+
+std-kernel: std-demo
+	$(CARGO) build --release --features std-test --target $(TARGET) --target-dir target/std-test
+	@mkdir -p build/std-test
+	$(OBJCOPY) -O binary target/std-test/$(TARGET)/release/kernel build/std-test/kernel.bin
+
+test-std: std-kernel
+	$(PYTHON) scripts/std_test.py "$(QEMU)" build/std-test/kernel.bin
+	$(PYTHON) scripts/std_test.py "$(QEMU)" build/std-test/kernel.bin --no-entropy
+
+check-std: std-demo
+	$(PYTHON) userspace/std-port/test_apply.py target/std-toolchain/library-pristine
+	$(CARGO) clippy --features std-test --target $(TARGET) --target-dir target/std-test -- -D warnings
+	rustfmt --edition 2024 --check userspace/std-runtime/src/lib.rs userspace/std-demo/src/main.rs

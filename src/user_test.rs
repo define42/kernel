@@ -30,7 +30,7 @@ pub fn run(
     }
     writeln!(console, "Kernel WP/NX fault checks passed.").ok();
     let ticks_before = crate::timer::ticks();
-    for mode in 1..=13 {
+    for mode in (1..=13).chain([17, 18, 19, 20, 21, 17]) {
         process.restart(mode);
         let mut calls = 0;
         let mut preemptions = 0;
@@ -64,9 +64,27 @@ pub fn run(
                     }
                     12 => assert_eq!(context.vector, 12, "noncanonical user stack"),
                     6 | 10 => assert_eq!(context.vector, 13, "privileged I/O/instruction"),
-                    8 => {
+                    8 | 20 => {
                         assert_eq!(context.vector, 14);
                         assert_eq!(context.error_code & 0x15, 0x15, "user NX fault");
+                        if mode == 20 {
+                            assert!(
+                                (abi::USER_HEAP_BASE..abi::USER_HEAP_END).contains(&context.cr2)
+                            );
+                        }
+                    }
+                    18 | 19 => {
+                        assert_eq!(context.vector, 14);
+                        assert_eq!(context.error_code & 5, 4, "unmapped heap guard");
+                        assert_eq!(
+                            context.cr2,
+                            if mode == 18 {
+                                abi::USER_HEAP_BASE - 8
+                            } else {
+                                abi::USER_HEAP_END
+                            }
+                        );
+                        assert_eq!(context.error_code & 2, if mode == 19 { 2 } else { 0 });
                     }
                     9 => {
                         assert_eq!(context.vector, 14);
@@ -88,10 +106,18 @@ pub fn run(
             match syscall::dispatch(process, sockets, handles, clock, console) {
                 syscall::Action::Exit(code) => {
                     assert!(
-                        mode <= 2 || mode == 11,
+                        mode <= 2 || matches!(mode, 11 | 17 | 21),
                         "fault probe unexpectedly survived: {mode}"
                     );
-                    assert_eq!(code, if mode == 1 { 3 } else { 0 }, "probe exit code");
+                    assert_eq!(
+                        code,
+                        match mode {
+                            1 => 3,
+                            21 => 1,
+                            _ => 0,
+                        },
+                        "probe exit code"
+                    );
                     writeln!(console, "Ring-3 probe {mode}: passed (exit {code})").ok();
                     break;
                 }

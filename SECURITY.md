@@ -30,11 +30,45 @@ service/restart path, and cannot change another interface's DMA assignment.
 Up to eight eligible cards can operate concurrently. Selection changes the
 console's configuration target; it does not redirect packets or stop other NICs.
 Each interface has its own ring-3 driver, TCP/IP and web processes, private memory
-and user stacks, bounded IPC queues, socket/admission state, and validated network
+and user stacks/heaps, bounded IPC queues, socket/admission state, and validated network
 configuration. Services cannot select another interface through the syscall ABI.
 Only its driver receives that interface's BAR and pinned DMA pool; each pool has
 a distinct VT-d domain, translation tables and IOVA window. Administratively down
 interfaces remain bus-master-disabled with absent DMA contexts.
+
+Each userspace heap has a fixed 512 KiB capacity, private allocator metadata,
+RW/NX permissions and unmapped boundary guards. Restart clears the whole arena.
+The allocator uses unsafe pointer operations and is part of the userspace review
+surface. It does not grant access to other processes or kernel memory; checked
+syscall copies still validate heap pages. Boundary guards do not detect
+intra-heap overflows or use-after-free. Infallible allocation failure exits the
+service and can consume its existing restart budget; fallible reservations
+allow callers to handle exhaustion without exiting.
+
+The optional [userspace std port](userspace/std-port/README.md) adds upstream
+standard-library code and a startup/runtime layer inside the caller's existing
+ring-3 address space. It uses the same fixed heap, checked copies, and page
+permissions; it adds no filesystem, socket, process-launching, or user-thread
+capability. The normal web/network/driver services remain stable `no_std` builds.
+The std demo uses a separate regression image and a repository-local pinned
+nightly compiler. Neither the compiler pin nor a successful QEMU run establishes
+that the port or underlying kernel is suitable for public deployment.
+
+The port's TLS and synchronization implementations require exactly one user
+thread per process and no asynchronous userspace signal callbacks. TLS
+destructors are not run at process exit; restart reclaims and zeros private
+memory. Enabling native user threads requires replacing these implementations.
+Panics and infallible allocation failures abort the process without unwinding.
+`std::net`, Tokio, Axum, and Actix are not integrated.
+
+The added random-byte syscall validates at most 256 writable bytes and leaves
+the destination unchanged if hardware entropy is unavailable. HashMap seeding
+aborts on that error; there is no weak fallback. Standard-output writes validate
+at most 512 readable input bytes and share the existing per-service log budget
+and bounded console queue. Partial writes and `WouldBlock` expose backpressure;
+terminal newline conversion and fragment framing still apply. Service output
+is untrusted terminal text, not authenticated administration. These calls do not
+allow services to read serial commands or bypass console configuration checks.
 
 An attributed NIC DMA fault stops and restarts only that interface's services;
 its recovery preserves peer fault records. Fault overflow, an unknown requester,
@@ -75,12 +109,14 @@ proxy, requests to an interface share its source-IP quota.
 
 ## Validation and dependencies
 
-`make audit` checks all three lockfiles against RustSec; install the audit tool
+`make audit` checks the three normal-build lockfiles against RustSec; install the audit tool
 separately, for example `cargo install cargo-audit --version 0.22.2 --locked`
 from outside this checkout, so its bare-metal Cargo target is not inherited.
 Do not ignore a finding solely because services run in ring 3. Record the exact
 commit, toolchain, image hashes, advisory database revision and test artifacts
-for a release candidate. Tests and fuzz scripts never contact arbitrary remote
+for a release candidate. The optional std port also requires review of its pinned
+compiler, patched standard-library sources, and their dependencies; the normal
+lockfile audit does not cover that private toolchain. Tests and fuzz scripts never contact arbitrary remote
 targets; their traffic is confined to owned QEMU guests.
 
 The [validation record](docs/VALIDATION.md) distinguishes tests actually run
