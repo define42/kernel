@@ -14,6 +14,8 @@ fn main() {
         "userspace/http.rs",
         "userspace/linker.ld",
         "userspace/netd.rs",
+        "userspace/arp_announce.rs",
+        "userspace/network_config.rs",
         "userspace/net_syscall.rs",
         "userspace/driver.rs",
         "userspace/e1000.rs",
@@ -23,6 +25,8 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
+    println!("cargo:rerun-if-env-changed=KERNEL_IR_PROBE");
+    println!("cargo:rerun-if-env-changed=KERNEL_SHARED_FAULT_PROBE");
     for (name, default, maximum) in [
         ("KERNEL_FUZZ_SEED", 1u64, u64::MAX),
         ("KERNEL_FUZZ_ITERATIONS", 100_000, 100_000_000),
@@ -36,6 +40,14 @@ fn main() {
             "fuzz configuration out of range"
         );
         println!("cargo:rustc-env={name}={value}");
+    }
+    for name in [
+        "KERNEL_IPV4",
+        "KERNEL_PREFIX",
+        "KERNEL_GATEWAY",
+        "KERNEL_ECHO",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
     }
     // The boot-only test deliberately has no userspace dependency.
     if env::var_os("CARGO_FEATURE_SMOKE_TEST").is_some() {

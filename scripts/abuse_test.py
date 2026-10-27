@@ -33,11 +33,10 @@ def main():
             # completing a TCP handshake or running application request logic.
             half_open = [Client(lab, rng, source=3) for _ in range(3)]
             for client in half_open:
-                client.send(2)
-                reply = client.receive()
-                if reply is None or reply[4] & 0x12 != 0x12:
-                    raise RuntimeError("half-open setup failed")
-                client.ack = (reply[2] + 1) & 0xffffffff
+                # The preceding RSTs and this SYN can arrive before the web
+                # service rearms its listeners. Use bounded, identical SYN
+                # retransmissions, but never ACK the required SYN-ACK.
+                client.begin_handshake()
             deadline = time.monotonic() + 3.3
             while time.monotonic() < deadline:
                 lab.receive(min(0.05, deadline - time.monotonic()))

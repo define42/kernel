@@ -1,8 +1,9 @@
-# QEMU's Multiboot loader enters here in 32-bit protected mode, paging off.
+# A Multiboot v1/v2 loader enters here in 32-bit protected mode, paging off.
 # The address fields let it load our flat binary even though Rust emits ELF64.
 .set MULTIBOOT_MAGIC, 0x1badb002
 .set MULTIBOOT_FLAGS, (1 << 16) | 3
 .set MULTIBOOT_BOOT_MAGIC, 0x2badb002
+.set MULTIBOOT2_BOOT_MAGIC, 0x36d76289
 
 .section .multiboot,"a",@progbits
 .balign 4
@@ -18,6 +19,36 @@ multiboot_header:
     .long _start
 multiboot_header_end:
 
+# GRUB's Multiboot2 path supplies a firmware memory map and an ACPI RSDP,
+# including on UEFI after ExitBootServices. The fixed-address and entry tags
+# load this same flat image and enter the existing 32-bit bootstrap.
+.balign 8
+multiboot2_header:
+    .long 0xe85250d6
+    .long 0                      # i386 protected-mode entry architecture.
+    .long multiboot2_header_end - multiboot2_header
+    .long -(0xe85250d6 + (multiboot2_header_end - multiboot2_header))
+    .short 2, 0                  # Required physical address tag.
+    .long 24
+    .long multiboot2_header
+    .long __kernel_start
+    .long __load_end
+    .long __kernel_end
+    .short 3, 0                  # Required 32-bit entry point.
+    .long 12
+    .long _start
+    .long 0                      # Tag alignment padding.
+    .short 1, 0                  # Require the memory map information tag.
+    .long 12
+    .long 6
+    .long 0
+    .short 1, 1                  # Request available ACPI RSDP tags (optional).
+    .long 16
+    .long 14, 15
+    .short 0, 0
+    .long 8
+multiboot2_header_end:
+
 .section .text.boot,"ax",@progbits
 .code32
 .global _start
@@ -26,7 +57,10 @@ _start:
     cli
     cld
     cmp eax, MULTIBOOT_BOOT_MAGIC
+    je .Lboot_magic_ok
+    cmp eax, MULTIBOOT2_BOOT_MAGIC
     jne .Lbad_multiboot
+.Lboot_magic_ok:
 
     # Keep the boot arguments across BSS initialization and CPUID.
     mov ebp, eax
@@ -66,6 +100,21 @@ _start:
     cpuid
     test edx, 1 << 29
     jz .Lno_long_mode
+
+    # Cache attributes are security-relevant for MMIO. The page tables use
+    # PAT entry 0 for RAM and entry 3 (PCD|PWT) for MMIO. A firmware-customized
+    # PAT must be rejected before the first mapped hardware register access.
+    mov eax, 1
+    cpuid
+    mov eax, edx
+    and eax, (1 << 16) | (1 << 5) # PAT and RDMSR support.
+    cmp eax, (1 << 16) | (1 << 5)
+    jne .Lbad_pat
+    mov ecx, 0x277                # IA32_PAT.
+    rdmsr
+    and eax, 0xff0000ff
+    cmp eax, 6                   # Entry 0 = WB (6), entry 3 = UC (0).
+    jne .Lbad_pat
 
     # PML4[0] -> PDPT[0..4] -> 2048 entries mapping the first 4 GiB.
     # All other entries and the high halves are zero from BSS clearing.
@@ -127,8 +176,11 @@ _start:
     jmp .Lboot_error
 .Lno_long_mode:
     mov al, 'L'
+    jmp .Lboot_error
+.Lbad_pat:
+    mov al, 'P'
 .Lboot_error:
-    # Red VGA diagnostic: ERROR: M (Multiboot), C (CPUID), or L (long mode).
+    # Red VGA diagnostic: M (Multiboot), C (CPUID), L (long mode), P (PAT).
     mov dword ptr [0xb8000], 0x4f524f45
     mov dword ptr [0xb8004], 0x4f4f4f52
     mov dword ptr [0xb8008], 0x4f3a4f52

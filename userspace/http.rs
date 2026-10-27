@@ -21,9 +21,9 @@ code{color:#b9d8ef}footer{margin-top:3rem;color:#a1b4c2;font-size:.9rem}
 <h1>Hello from the Rust kernel.</h1>
 <p>This page is served by an isolated Rust userspace process running in ring 3.</p>
 <p>An Intel e1000 NIC connects the kernel to an IPv4 and TCP network, powered by smoltcp.</p>
-<p>The kernel handles network traffic; this process handles HTTP. No heap required.</p>
+<p>Separate userspace services handle Ethernet, TCP/IP, and HTTP. No heap required.</p>
 <p><a href="/healthz">Check server health &rarr;</a></p>
-<footer>Guest <code>10.0.2.15:80</code> &middot; HTTP/1.1 &middot; Rust</footer>
+<footer>Port <code>80</code> &middot; HTTP/1.1 &middot; Rust</footer>
 </main></body></html>
 "#;
 

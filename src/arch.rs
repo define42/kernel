@@ -21,6 +21,8 @@ const TSS_SELECTOR: u16 = 0x28;
 const STACK_BYTES: usize = 32 * 1024;
 const GUARD_BYTES: usize = 4096;
 pub const TIMER_VECTOR: u64 = 32;
+#[cfg(feature = "baremetal")]
+pub const SPURIOUS_VECTOR: u8 = 255;
 
 /// Saved general registers followed by the normalized x86-64 trap frame.
 ///
@@ -182,8 +184,12 @@ unsafe extern "C" {
     fn arch_resume(context: *mut Context);
     fn arch_int80();
     fn arch_unexpected();
+    #[cfg(feature = "baremetal")]
+    fn arch_spurious();
     static arch_exception_vectors: [u64; 32];
     static arch_irq_vectors: [u64; 16];
+    #[cfg(all(feature = "userspace-test", feature = "baremetal"))]
+    fn arch_probe_spurious(context: *mut Context);
     #[cfg(feature = "userspace-test")]
     fn arch_probe_write(address: u64) -> u64;
     #[cfg(feature = "userspace-test")]
@@ -264,6 +270,12 @@ pub fn init() {
         }
         idt.add(0x80)
             .write(Gate::interrupt(arch_int80 as *const () as u64, 3, 0));
+        #[cfg(feature = "baremetal")]
+        idt.add(SPURIOUS_VECTOR as usize).write(Gate::interrupt(
+            arch_spurious as *const () as u64,
+            0,
+            0,
+        ));
         let idt_pointer = TablePointer {
             limit: (size_of::<[Gate; 256]>() - 1) as u16,
             base: addr_of!(IDT) as u64,
@@ -272,7 +284,7 @@ pub fn init() {
     }
 }
 
-/// Run userspace until INT 0x80, IRQ0, or an exception, updating `context`.
+/// Run userspace until INT 0x80, the timer, or an exception, updating `context`.
 ///
 /// # Safety
 /// Call only on the bootstrap CPU after `init`, with external interrupts
@@ -303,6 +315,31 @@ pub unsafe fn resume(context: &mut Context) {
     context.rflags = (context.rflags & 0x0cd5) | 0x202;
     // SAFETY: the caller guarantees the mapping/lifetime/CPU invariants above.
     unsafe { arch_resume(context) };
+}
+
+/// Test the user spurious-return path without executing a user instruction.
+#[cfg(all(feature = "userspace-test", feature = "baremetal"))]
+pub fn check_spurious_context() {
+    let invalid_stack = 0x0000_8000_0000_0000;
+    let mut context = Context::user(crate::userspace::USER_BASE, invalid_stack, 0);
+    let before = crate::timer::ticks();
+    // SAFETY: one CPU, IF clear, installed tables and resident kernel context.
+    // The helper constructs a hardware-shaped user frame and enters the actual
+    // spurious handler. It must yield before attempting IRET to this bad RSP.
+    unsafe { arch_probe_spurious(&mut context) };
+    assert_eq!(context.vector, TIMER_VECTOR);
+    assert_eq!(context.rsp, invalid_stack);
+    assert_eq!(
+        crate::timer::ticks(),
+        before,
+        "spurious IRQ counted as timer tick"
+    );
+    // SAFETY: resume rejects this noncanonical stack before entering assembly.
+    unsafe { resume(&mut context) };
+    assert_eq!(
+        context.vector, 12,
+        "spurious return bypassed stack validation"
+    );
 }
 
 /// Supervisor guard pages to remove from the identity mapping before entry.

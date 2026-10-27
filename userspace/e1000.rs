@@ -132,8 +132,26 @@ pub struct E1000 {
 }
 
 impl E1000 {
-    pub fn init(mmio: u64, dma: u64, iova: u64) -> Result<Self, &'static str> {
-        if mmio != 0x5000_0000 || dma != 0x5020_0000 || iova != 0x1000_0000 {
+    pub fn init(mmio: u64, dma: u64, iova: u64, requested_mac: u64) -> Result<Self, &'static str> {
+        // The kernel passes a validated administrative override, or zero on
+        // first boot. Validate again before touching the NIC's registers.
+        let requested_mac = if requested_mac == 0 {
+            None
+        } else {
+            let bytes: [u8; 6] = requested_mac.to_le_bytes()[..6].try_into().unwrap();
+            if requested_mac >> 48 != 0 || !valid_mac(bytes) {
+                return Err("invalid configured NIC MAC address");
+            }
+            Some(bytes)
+        };
+        let valid_iova = iova
+            .checked_sub(crate::abi::DRIVER_IOVA)
+            .is_some_and(|offset| {
+                offset.is_multiple_of(crate::abi::DRIVER_IOVA_STRIDE)
+                    && offset / crate::abi::DRIVER_IOVA_STRIDE
+                        < crate::abi::MAX_NIC_INTERFACES as u64
+            });
+        if mmio != crate::abi::DRIVER_MMIO || dma != crate::abi::DRIVER_DMA || !valid_iova {
             return Err("invalid NIC capability addresses");
         }
         let mut nic = Self {
@@ -162,7 +180,10 @@ impl E1000 {
         nic.write(IMC, u32::MAX);
         nic.read(ICR);
         nic.reset_phy()?;
-        nic.mac = nic.read_mac()?;
+        nic.mac = match requested_mac {
+            Some(mac) => mac,
+            None => nic.read_mac()?,
+        };
         nic.write(RAL, u32::from_le_bytes(nic.mac[..4].try_into().unwrap()));
         nic.write(
             RAH,
@@ -385,7 +406,7 @@ impl E1000 {
         // invalid CPU pointer. VT-d must fault it before any memory is read.
         unsafe {
             addr_of_mut!((*self.dma).tx[0]).write_volatile(TxDescriptor {
-                address: 0x0010_0000,
+                address: crate::abi::KERNEL_PROBE_ADDRESS,
                 length: 60,
                 command: TX_END_OF_PACKET | TX_INSERT_FCS | TX_REPORT_STATUS,
                 ..TxDescriptor::EMPTY

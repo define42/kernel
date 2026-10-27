@@ -44,7 +44,7 @@ pub extern "C" fn _start(mode: u64, seed: u64, iterations: u64) -> ! {
     for (connection, socket) in connections.iter_mut().zip(sockets.iter_mut()) {
         connection.poll(socket, now);
     }
-    syscall::log("HTTP listening on 10.0.2.15:80\n");
+    syscall::log("HTTP listening on port 80\n");
     loop {
         syscall::poll();
         let now = syscall::now_millis();
@@ -84,8 +84,10 @@ fn run_probe(mode: u64) -> ! {
                 assert_eq!(syscall::raw(abi::SYS_LISTEN, 0, 81, 0), abi::EACCES);
                 syscall::exit(0);
             }
-            3 => asm!("mov rax, qword ptr [rdi]", in("rdi") 0x10_0000_u64, out("rax") _),
-            4 => asm!("mov byte ptr [rdi], 0", in("rdi") 0x10_0000_u64),
+            3 => {
+                asm!("mov rax, qword ptr [rdi]", in("rdi") abi::KERNEL_PROBE_ADDRESS, out("rax") _)
+            }
+            4 => asm!("mov byte ptr [rdi], 0", in("rdi") abi::KERNEL_PROBE_ADDRESS),
             5 => asm!("mov eax, dword ptr [rdi]", in("rdi") 0xfed0_0000_u64, out("eax") _),
             6 => asm!("out dx, al", in("dx") 0x3f8_u16, in("al") 0_u8),
             7 => asm!("mov byte ptr [rdi], 0x90", in("rdi") _start as *const () as u64),
@@ -122,7 +124,7 @@ fn run_probe(mode: u64) -> ! {
             ),
             13 => asm!("2:", "pause", "jmp 2b", options(noreturn)),
             16 => {
-                for number in abi::SYS_FRAME_RECV..=abi::SYS_MAC_REGISTER {
+                for number in abi::SYS_FRAME_RECV..=abi::SYS_NET_CONFIG {
                     assert_eq!(syscall::raw(number, 0, 0, 0), abi::EACCES);
                 }
                 for address in [abi::DRIVER_MMIO, abi::DRIVER_DMA, 0x100000, u64::MAX] {

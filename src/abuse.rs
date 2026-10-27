@@ -20,6 +20,7 @@ const SOURCE_IDLE_MS: i64 = 30_000;
 const HALF_OPEN_MS: i64 = 3000;
 const LIFETIME_MS: i64 = 15_000;
 const HTTP_PORT: u16 = 80;
+#[cfg(test)]
 const LOCAL_IP: IpAddress = IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15));
 
 #[derive(Clone, Copy)]
@@ -70,6 +71,7 @@ struct Active {
 }
 
 pub struct Guard {
+    local_ip: IpAddress,
     sources: [Option<Source>; SOURCES],
     active: [Option<Active>; SLOTS],
     global: Bucket,
@@ -83,7 +85,12 @@ impl Default for Guard {
 
 impl Guard {
     pub const fn new() -> Self {
+        Self::for_address(Ipv4Address::new(10, 0, 2, 15))
+    }
+
+    pub const fn for_address(address: Ipv4Address) -> Self {
         Self {
+            local_ip: IpAddress::Ipv4(address),
             sources: [None; SOURCES],
             active: [None; SLOTS],
             global: Bucket::new(GLOBAL_BURST, 0),
@@ -142,7 +149,7 @@ impl Guard {
             return true;
         };
         if ip.version() != 4
-            || IpAddress::Ipv4(ip.dst_addr()) != LOCAL_IP
+            || IpAddress::Ipv4(ip.dst_addr()) != self.local_ip
             || ip.next_header() != IpProtocol::Tcp
             || ip.more_frags()
             || ip.frag_offset() != 0
@@ -160,7 +167,7 @@ impl Guard {
         if !address.is_unicast()
             || tcp.src_port() == 0
             || !ip.verify_checksum()
-            || !tcp.verify_checksum(&address, &LOCAL_IP)
+            || !tcp.verify_checksum(&address, &self.local_ip)
         {
             return false;
         }
@@ -182,7 +189,7 @@ impl Guard {
         }
         let ip = Ipv4Packet::new_checked(ethernet.payload()).ok()?;
         if ip.version() != 4
-            || IpAddress::Ipv4(ip.dst_addr()) != LOCAL_IP
+            || IpAddress::Ipv4(ip.dst_addr()) != self.local_ip
             || ip.next_header() != IpProtocol::Tcp
             || ip.more_frags()
             || ip.frag_offset() != 0
@@ -195,7 +202,7 @@ impl Guard {
             address: IpAddress::Ipv4(ip.src_addr()),
             port: tcp.src_port(),
         };
-        if tcp.dst_port() != HTTP_PORT || !tcp.verify_checksum(&tuple.address, &LOCAL_IP) {
+        if tcp.dst_port() != HTTP_PORT || !tcp.verify_checksum(&tuple.address, &self.local_ip) {
             return None;
         }
         self.active
@@ -280,6 +287,10 @@ mod tests {
     }
 
     fn syn(source: u8, port: u16) -> [u8; 54] {
+        syn_to(source, port, Ipv4Address::new(10, 0, 2, 15))
+    }
+
+    fn syn_to(source: u8, port: u16, destination: Ipv4Address) -> [u8; 54] {
         let mut bytes = [0; 54];
         let mut ethernet = EthernetFrame::new_unchecked(&mut bytes[..]);
         ethernet.set_ethertype(EthernetProtocol::Ipv4);
@@ -292,15 +303,34 @@ mod tests {
         ip.set_hop_limit(64);
         ip.set_next_header(IpProtocol::Tcp);
         ip.set_src_addr(Ipv4Address::new(10, 0, 2, source));
-        ip.set_dst_addr(Ipv4Address::new(10, 0, 2, 15));
+        ip.set_dst_addr(destination);
         ip.fill_checksum();
         let mut tcp = TcpPacket::new_unchecked(ip.payload_mut());
         tcp.set_src_port(port);
         tcp.set_dst_port(HTTP_PORT);
         tcp.set_header_len(20);
         tcp.set_syn(true);
-        tcp.fill_checksum(&tuple(source, port).address, &LOCAL_IP);
+        tcp.fill_checksum(&tuple(source, port).address, &destination.into());
         bytes
+    }
+
+    #[test]
+    fn configured_address_preserves_admission_and_existing_tuple_priority() {
+        let destination = Ipv4Address::new(203, 0, 113, 10);
+        let mut guard = Guard::for_address(destination);
+        for port in 1..=SOURCE_BURST as u16 {
+            assert!(guard.allow(&syn_to(2, port, destination), 0));
+        }
+        assert!(!guard.allow(&syn_to(2, 100, destination), 0));
+        assert!(guard.allow(&syn(2, 100), 0)); // An unrelated destination is ignored.
+        guard.active[1] = Some(Active {
+            tuple: tuple(2, 100),
+            started: 0,
+            half_open: true,
+        });
+        assert!(guard.allow(&syn_to(2, 100, destination), 0));
+        assert_eq!(guard.matching_slot(&syn_to(2, 100, destination)), Some(1));
+        assert_eq!(guard.matching_slot(&syn(2, 100)), None);
     }
 
     #[test]

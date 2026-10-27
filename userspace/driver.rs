@@ -17,14 +17,14 @@ const MAC_REGISTER: u64 = 18;
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
-pub extern "C" fn _start(mmio: u64, dma: u64, iova: u64, mode: u64) -> ! {
+pub extern "C" fn _start(mmio: u64, dma: u64, iova: u64, mode: u64, probe: u64, mac: u64) -> ! {
     let cs: u16;
     // SAFETY: reading CS is unprivileged.
     unsafe {
         asm!("mov {value:x}, cs", value = out(reg) cs, options(nomem, nostack, preserves_flags));
     }
     assert_eq!(cs & 3, 3);
-    let mut nic = match e1000::E1000::init(mmio, dma, iova) {
+    let mut nic = match e1000::E1000::init(mmio, dma, iova, mac) {
         Ok(nic) => nic,
         Err(error) => {
             syscall::log(error);
@@ -49,11 +49,23 @@ pub extern "C" fn _start(mmio: u64, dma: u64, iova: u64, mode: u64) -> ! {
         "e1000: link down\n"
     });
     #[cfg(not(driver_test))]
-    let _ = mode;
+    let _ = (mode, probe);
     #[cfg(driver_test)]
     match mode {
         0 => {}
         1 => {
+            // Once READY has published the address, even a repeated valid
+            // registration must not mutate the running service's identity.
+            assert_eq!(
+                unsafe { syscall::raw(MAC_REGISTER, u64::from_le_bytes(packed), 0, 0) },
+                abi::EACCES
+            );
+            // A driver cannot read or change the network service configuration.
+            // SAFETY: capability denial must happen before pointer access.
+            assert_eq!(
+                unsafe { syscall::raw(abi::SYS_NET_CONFIG, 0, abi::NET_CONFIG_SIZE as u64, 0) },
+                abi::EACCES
+            );
             nic.probe_forbidden_read();
             loop {
                 syscall::poll();
@@ -74,9 +86,24 @@ pub extern "C" fn _start(mmio: u64, dma: u64, iova: u64, mode: u64) -> ! {
             syscall::log("Driver interrupt aperture NMI/INIT/SMI probe survived\n");
             syscall::exit(0);
         }
+        6 => {
+            nic.probe_dma_write(0xfee0_0010)
+                .expect("remapped interrupt write probe");
+            loop {
+                syscall::poll();
+            }
+        }
         5 => {
-            nic.probe_dma_write(0x0010_0000)
+            nic.probe_dma_write(abi::KERNEL_PROBE_ADDRESS)
                 .expect("forbidden DMA write probe");
+            loop {
+                syscall::poll();
+            }
+        }
+        7 => {
+            // This IOVA belongs to another NIC's distinct VT-d domain.
+            nic.probe_dma_write(probe)
+                .expect("cross-interface DMA write probe");
             loop {
                 syscall::poll();
             }

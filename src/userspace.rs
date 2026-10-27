@@ -16,7 +16,12 @@ use crate::arch::Context;
 pub const USER_BASE: u64 = 0x4000_0000;
 pub const USER_END: u64 = 0x4020_0000;
 pub const STACK_BOTTOM: u64 = USER_END - 64 * 1024;
-pub const PROCESS_COUNT: usize = 3;
+pub const SERVICES_PER_INTERFACE: usize = 3;
+#[cfg(feature = "userspace-test")]
+pub const PROCESS_COUNT: usize = SERVICES_PER_INTERFACE;
+#[cfg(not(feature = "userspace-test"))]
+pub const PROCESS_COUNT: usize = SERVICES_PER_INTERFACE * crate::nic::MAX_INTERFACES;
+/// The driver role within each interface's consecutive process group.
 pub const DRIVER_SLOT: usize = 2;
 pub const DEVICE_MMIO: u64 = 0x5000_0000;
 pub const DEVICE_DMA: u64 = 0x5020_0000;
@@ -163,7 +168,8 @@ impl Process {
     }
 
     /// Load a process into its fixed slot and activate its address space.
-    /// Slots 0, 1, and 2 belong to the web, network, and driver processes.
+    /// Each consecutive group of three slots owns one interface: web, network,
+    /// then driver. Every group has distinct physical storage and page tables.
     pub fn load_slot(image: &'static [u8], slot: usize) -> Result<Self, &'static str> {
         if slot >= PROCESS_COUNT {
             return Err("invalid process slot");
@@ -197,6 +203,12 @@ impl Process {
         process.restart(0);
         process.activate();
         Ok(process)
+    }
+
+    /// Interface whose fixed process group owns this address space.
+    #[cfg(not(feature = "userspace-test"))]
+    pub fn interface_index(&self) -> usize {
+        self.slot / SERVICES_PER_INTERFACE
     }
 
     /// Install this process's private CR3 before `arch::resume`.
@@ -279,7 +291,7 @@ impl Process {
         length: usize,
         uncached: bool,
     ) -> Result<(), &'static str> {
-        if self.slot != DRIVER_SLOT {
+        if self.slot % SERVICES_PER_INTERFACE != DRIVER_SLOT {
             return Err("device mappings require the driver slot");
         }
         if length == 0
@@ -350,6 +362,53 @@ impl Process {
                 .write(DeviceMapping { physical, length });
             // Flush only when this process is active; a future CR3 switch will
             // flush the translation if another process is currently selected.
+            let root = addr_of!((*store).pml4) as u64;
+            if active_root() == root {
+                switch_root(root);
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove the driver's old BAR and DMA mappings before assigning resources.
+    ///
+    /// # Safety
+    /// Stop this driver and its DMA first, and acknowledge VT-d revocation.
+    /// Keep the old DMA allocation pinned. Call only on the bootstrap CPU with
+    /// IF clear; the driver must not resume until its new assignment is ready.
+    #[cfg(not(feature = "userspace-test"))]
+    pub unsafe fn unmap_devices(&mut self) -> Result<(), &'static str> {
+        if self.slot % SERVICES_PER_INTERFACE != DRIVER_SLOT {
+            return Err("device unmapping requires the driver slot");
+        }
+        let store = storage(self.slot);
+        // SAFETY: caller owns this stopped process. Restore the supervisor
+        // identity PDEs, remove every old leaf, and clear permission metadata.
+        // No user mapping survives, even if a later assignment fails.
+        unsafe {
+            for (index, virtual_addr) in [DEVICE_MMIO, DEVICE_DMA].into_iter().enumerate() {
+                let pde = ((virtual_addr >> 21) & 511) as usize;
+                let supervisor = addr_of!(boot_page_directory)
+                    .cast::<u64>()
+                    .add(PAGE_COUNT + pde)
+                    .read_volatile();
+                write_volatile(
+                    addr_of_mut!((*store).directory).cast::<u64>().add(pde),
+                    supervisor,
+                );
+                let table = if index == 0 {
+                    addr_of_mut!((*store).mmio).cast::<u64>()
+                } else {
+                    addr_of_mut!((*store).dma).cast::<u64>()
+                };
+                for page in 0..PAGE_COUNT {
+                    write_volatile(table.add(page), 0);
+                }
+                addr_of_mut!((*store).devices)
+                    .cast::<DeviceMapping>()
+                    .add(index)
+                    .write(DeviceMapping::EMPTY);
+            }
             let root = addr_of!((*store).pml4) as u64;
             if active_root() == root {
                 switch_root(root);
@@ -553,11 +612,18 @@ unsafe fn switch_root(root: u64) {
 }
 
 pub(crate) fn slot_for_root(root: u64) -> Option<usize> {
-    (0..PROCESS_COUNT).find(|&slot| {
-        CLAIMED[slot].load(Ordering::Acquire)
-            // SAFETY: slot lies within static storage; no field is dereferenced.
-            && unsafe { addr_of!((*storage(slot)).pml4) as u64 == root }
-    })
+    // All roots have the same offset in a fixed, contiguous storage array.
+    // Validate the exact stride and claimed slot rather than scanning every
+    // interface's processes on each page inspected by the permission audit.
+    // SAFETY: the first slot exists; computing its field address reads no data.
+    let first = unsafe { addr_of!((*storage(0)).pml4) as u64 };
+    let offset = root.checked_sub(first)?;
+    let stride = size_of::<Storage>() as u64;
+    if !offset.is_multiple_of(stride) {
+        return None;
+    }
+    let slot = usize::try_from(offset / stride).ok()?;
+    CLAIMED.get(slot)?.load(Ordering::Acquire).then_some(slot)
 }
 
 /// Audit helpers intentionally return only table identities and allowed page
@@ -605,7 +671,7 @@ pub(crate) fn allowed_user_page(
         if (USER_BASE..USER_END).contains(&address) {
             return physical == addr_of!((*store).backing) as u64 + address - USER_BASE;
         }
-        if slot != DRIVER_SLOT || !writable || executable {
+        if slot % SERVICES_PER_INTERFACE != DRIVER_SLOT || !writable || executable {
             return false;
         }
         for (index, base) in [DEVICE_MMIO, DEVICE_DMA].into_iter().enumerate() {
@@ -627,14 +693,17 @@ pub(crate) fn allowed_user_page(
 /// giving any process its service startup arguments.
 #[cfg(feature = "isolation-test")]
 pub fn check_isolation(web: &mut Process, network: &mut Process, driver: &mut Process) {
+    let group_start = web.slot;
+    assert_eq!(group_start % SERVICES_PER_INTERFACE, 0);
     let mut processes = [web, network, driver];
     let address = STACK_BOTTOM;
-    let mut roots = [0; PROCESS_COUNT];
-    let mut physical = [0; PROCESS_COUNT];
+    let mut roots = [0; SERVICES_PER_INTERFACE];
+    let mut physical = [0; SERVICES_PER_INTERFACE];
     for (index, process) in processes.iter_mut().enumerate() {
         assert_eq!(
-            process.slot, index,
-            "isolation check requires all three slots"
+            process.slot,
+            group_start + index,
+            "isolation check requires one interface process group"
         );
         process.restart(0);
         process
@@ -655,8 +724,8 @@ pub fn check_isolation(web: &mut Process, network: &mut Process, driver: &mut Pr
         assert!(!process.validate_buffer(DEVICE_MMIO, 1, false));
         assert!(!process.validate_buffer(DEVICE_DMA, 1, true));
     }
-    for first in 0..PROCESS_COUNT {
-        for second in first + 1..PROCESS_COUNT {
+    for first in 0..SERVICES_PER_INTERFACE {
+        for second in first + 1..SERVICES_PER_INTERFACE {
             assert_ne!(roots[first], roots[second], "process roots alias");
             assert_ne!(
                 physical[first], physical[second],
@@ -671,7 +740,7 @@ pub fn check_isolation(web: &mut Process, network: &mut Process, driver: &mut Pr
         let context = run_isolation_probe(process, READ, address);
         assert_eq!(context.vector, 128);
         assert_eq!(context.rax, 0x1234_5678 + index as u64);
-        let other = physical[(index + 1) % PROCESS_COUNT];
+        let other = physical[(index + 1) % SERVICES_PER_INTERFACE];
         let context = run_isolation_probe(process, READ, other);
         assert_eq!(context.vector, 14, "cross-process physical read must fault");
         assert_eq!(context.error_code & 5, 5);
@@ -696,7 +765,7 @@ pub fn check_isolation(web: &mut Process, network: &mut Process, driver: &mut Pr
         0x0f, 0xae, 0x5f, 0x2c, // stmxcsr [rdi+44]
         0xcd, 0x80, 0x0f, 0x0b,
     ];
-    let mut expected = [[0u8; 48]; PROCESS_COUNT];
+    let mut expected = [[0u8; 48]; SERVICES_PER_INTERFACE];
     for (index, process) in processes.iter_mut().enumerate() {
         let input = &mut expected[index];
         input[..16].fill(0x11 + index as u8);
@@ -739,6 +808,177 @@ pub fn check_isolation(web: &mut Process, network: &mut Process, driver: &mut Pr
     activate_kernel();
     crate::memory::check_permissions();
     check_kernel_extended_state();
+}
+
+/// Exercise CPU isolation between two concurrently assigned NIC process groups.
+/// Each group keeps the same user virtual addresses, but every private page and
+/// driver resource must resolve to only that group's physical allocation.
+///
+/// # Safety
+/// Both drivers must be stopped with PCI bus mastering disabled. Their DMA
+/// pools must remain pinned and exclusively owned: this probe temporarily
+/// replaces the first eight bytes and restores them before returning. Call
+/// before installing service startup arguments; all six ELF images restart.
+#[cfg(all(feature = "isolation-test", not(feature = "userspace-test")))]
+pub unsafe fn check_interface_isolation(
+    first: [&mut Process; SERVICES_PER_INTERFACE],
+    second: [&mut Process; SERVICES_PER_INTERFACE],
+) {
+    const COUNT: usize = SERVICES_PER_INTERFACE * 2;
+    const READ: &[u8] = &[0x48, 0x8b, 0x07, 0xcd, 0x80, 0x0f, 0x0b];
+    let group_starts = [first[0].slot, second[0].slot];
+    assert_ne!(group_starts[0], group_starts[1]);
+    for start in group_starts {
+        assert_eq!(start % SERVICES_PER_INTERFACE, 0);
+    }
+    let [first_web, first_network, first_driver] = first;
+    let [second_web, second_network, second_driver] = second;
+    let mut processes = [
+        first_web,
+        first_network,
+        first_driver,
+        second_web,
+        second_network,
+        second_driver,
+    ];
+    let mut resources = [[DeviceMapping::EMPTY; 2]; 2];
+    for (group, mappings) in resources.iter_mut().enumerate() {
+        let driver = &processes[group * SERVICES_PER_INTERFACE + DRIVER_SLOT];
+        // SAFETY: both driver slots are claimed and stopped by the caller.
+        *mappings = unsafe { addr_of!((*storage(driver.slot)).devices).read() };
+        assert_eq!(mappings[0].length, MMIO_LENGTH);
+        assert!(mappings[1].length >= size_of::<u64>());
+    }
+    for (first, second) in resources[0].iter().zip(&resources[1]) {
+        assert!(
+            first.physical + first.length as u64 <= second.physical
+                || second.physical + second.length as u64 <= first.physical,
+            "NIC groups share device resources"
+        );
+    }
+    let mut roots = [0; COUNT];
+    let mut physical = [0; COUNT];
+    for (index, process) in processes.iter_mut().enumerate() {
+        let group = index / SERVICES_PER_INTERFACE;
+        let role = index % SERVICES_PER_INTERFACE;
+        assert_eq!(process.slot, group_starts[group] + role);
+        process.restart(0);
+        process
+            .copy_to_user(STACK_BOTTOM, &(0x8765_4321u64 + index as u64).to_le_bytes())
+            .unwrap();
+        process.activate();
+        crate::memory::check_permissions();
+        roots[index] = active_root();
+        physical[index] = crate::memory::permissions(STACK_BOTTOM).unwrap().physical;
+        for (kind, address) in [DEVICE_MMIO, DEVICE_DMA].into_iter().enumerate() {
+            let mapping = crate::memory::permissions(address).unwrap();
+            assert_eq!(mapping.user, role == DRIVER_SLOT);
+            if role == DRIVER_SLOT {
+                assert_eq!(mapping.physical, resources[group][kind].physical);
+                assert!(mapping.writable && !mapping.executable);
+            }
+            assert!(!process.validate_buffer(address, 1, false));
+            assert!(!process.validate_buffer(address, 1, true));
+        }
+    }
+    for first in 0..COUNT {
+        for second in first + 1..COUNT {
+            assert_ne!(roots[first], roots[second], "NIC process roots alias");
+            assert_ne!(physical[first], physical[second], "NIC private pages alias");
+        }
+    }
+    let mut saved_dma = [0u64; 2];
+    for (group, saved) in saved_dma.iter_mut().enumerate() {
+        // SAFETY: the caller stopped both DMA engines; the aligned pools are
+        // pinned, exclusively owned, and large enough for this temporary word.
+        unsafe {
+            let pointer = resources[group][1].physical as *mut u64;
+            *saved = read_volatile(pointer);
+            write_volatile(pointer, 0xcafe_0010u64 + group as u64);
+        }
+    }
+    for (index, process) in processes.iter_mut().enumerate() {
+        let group = index / SERVICES_PER_INTERFACE;
+        let peer = 1 - group;
+        let context = run_isolation_probe(process, READ, STACK_BOTTOM);
+        assert_eq!(context.vector, 128);
+        assert_eq!(context.rax, 0x8765_4321 + index as u64);
+        if index % SERVICES_PER_INTERFACE == DRIVER_SLOT {
+            let context = run_isolation_probe(process, READ, DEVICE_DMA);
+            assert_eq!(context.vector, 128);
+            assert_eq!(context.rax, 0xcafe_0010 + group as u64);
+        } else {
+            for address in [DEVICE_MMIO, DEVICE_DMA] {
+                let context = run_isolation_probe(process, READ, address);
+                assert_eq!(context.vector, 14, "non-driver device read must fault");
+                assert_eq!(context.error_code & 5, 5);
+                assert_eq!(context.cr2, address);
+            }
+        }
+        for address in [
+            physical[peer * SERVICES_PER_INTERFACE + index % SERVICES_PER_INTERFACE],
+            resources[peer][0].physical,
+            resources[peer][1].physical,
+        ] {
+            process.activate();
+            let mapping = crate::memory::permissions(address);
+            if let Some(mapping) = mapping.filter(|mapping| mapping.user) {
+                // A firmware BAR can numerically coincide with a fixed user
+                // virtual window. It must translate elsewhere, never expose
+                // the peer physical BAR at that alias; table audits above
+                // also reject peer resources at every other user address.
+                assert_ne!(
+                    mapping.physical, address,
+                    "peer resource is user accessible"
+                );
+                continue;
+            }
+            let context = run_isolation_probe(process, READ, address);
+            assert_eq!(context.vector, 14, "cross-NIC physical read must fault");
+            assert_eq!(context.error_code & 4, 4);
+            assert_eq!(context.cr2, address);
+        }
+    }
+    for (group, saved) in saved_dma.into_iter().enumerate() {
+        // SAFETY: both pools are still stopped and pinned, as above.
+        unsafe { write_volatile(resources[group][1].physical as *mut u64, saved) };
+    }
+    for process in processes {
+        process.restart(0);
+    }
+    activate_kernel();
+    crate::memory::check_permissions();
+    check_kernel_extended_state();
+}
+
+/// Verify old BAR/DMA access is denied from CPL3 after a successful DMA revoke.
+///
+/// # Safety
+/// The caller must have stopped the device and acknowledged VT-d revocation;
+/// no driver execution may resume except the probes below until reconfigured.
+#[cfg(all(feature = "isolation-test", not(feature = "userspace-test")))]
+pub unsafe fn check_device_unmapping(driver: &mut Process) {
+    assert_eq!(driver.slot % SERVICES_PER_INTERFACE, DRIVER_SLOT);
+    driver.activate();
+    // SAFETY: the caller's successful Device::stop established these conditions.
+    unsafe {
+        driver
+            .unmap_devices()
+            .expect("revoke old driver CPU mappings")
+    };
+    crate::memory::check_permissions();
+    for address in [DEVICE_MMIO, DEVICE_DMA] {
+        driver.activate();
+        assert!(!crate::memory::permissions(address).unwrap().user);
+        const READ: &[u8] = &[0x48, 0x8b, 0x07, 0xcd, 0x80, 0x0f, 0x0b];
+        let context = run_isolation_probe(driver, READ, address);
+        assert_eq!(context.vector, 14, "revoked driver resource must fault");
+        assert_eq!(context.error_code & 5, 5);
+        assert_eq!(context.cr2, address);
+    }
+    driver.restart(0);
+    activate_kernel();
+    crate::memory::check_permissions();
 }
 
 #[cfg(feature = "isolation-test")]

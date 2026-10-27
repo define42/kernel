@@ -2,6 +2,10 @@ use core::arch::asm;
 use core::fmt;
 use core::ptr::{read_volatile, write_volatile};
 
+#[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+#[path = "serial_output.rs"]
+mod serial_output;
+
 const VGA_BUFFER: *mut u16 = 0xb8000 as *mut u16;
 const WIDTH: usize = 80;
 const HEIGHT: usize = 25;
@@ -11,6 +15,12 @@ const COM1: u16 = 0x3f8;
 pub struct Console {
     row: usize,
     column: usize,
+    // LSR reads clear UART errors, including reads made while polling TX.
+    receive_error: bool,
+    #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+    defer_logs: bool,
+    #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+    logs: serial_output::Logs,
 }
 
 impl Console {
@@ -30,18 +40,39 @@ impl Console {
                 write_volatile(VGA_BUFFER.add(cell), COLOR | u16::from(b' '));
             }
         }
-        Self { row: 0, column: 0 }
+        Self {
+            row: 0,
+            column: 0,
+            receive_error: false,
+            #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+            defer_logs: false,
+            #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+            logs: serial_output::Logs::new(),
+        }
     }
 
     fn write_byte(&mut self, byte: u8) {
-        if byte == b'\n' {
-            Self::serial_byte(b'\r');
+        #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+        if self.defer_logs {
+            if byte == b'\n' {
+                self.logs.push(b'\r');
+            }
+            self.logs.push(byte);
+            self.vga_byte(byte);
+            return;
         }
-        Self::serial_byte(byte);
+        if byte == b'\n' {
+            self.serial_byte(b'\r');
+        }
+        self.serial_byte(byte);
+        self.vga_byte(byte);
+    }
 
+    fn vga_byte(&mut self, byte: u8) {
         match byte {
             b'\n' => self.newline(),
             b'\r' => self.column = 0,
+            8 => self.column = self.column.saturating_sub(1),
             byte => {
                 if self.column == WIDTH {
                     self.newline();
@@ -82,15 +113,112 @@ impl Console {
         }
     }
 
-    fn serial_byte(byte: u8) {
+    fn serial_status(&mut self) -> u8 {
+        // SAFETY: COM1 LSR, accessed only by the single bootstrap CPU with IF clear.
+        let status = unsafe { inb(COM1 + 5) };
+        self.receive_error |= status & 0x1e != 0;
+        status
+    }
+
+    /// One nonblocking receive probe. Lost/corrupt bytes invalidate the line.
+    #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+    pub fn read_serial(&mut self) -> Option<Result<u8, ()>> {
+        let status = self.serial_status();
+        if status == 0xff {
+            return None; // Unpopulated legacy port.
+        }
+        if core::mem::take(&mut self.receive_error) {
+            if status & 1 != 0 {
+                // SAFETY: consume the possibly damaged FIFO head.
+                unsafe {
+                    inb(COM1);
+                }
+            }
+            return Some(Err(()));
+        }
+        if status & 1 == 0 {
+            return None;
+        }
+        // SAFETY: LSR reports a byte in the receive FIFO.
+        Some(Ok(unsafe { inb(COM1) }))
+    }
+
+    /// Let the shell arbitrate serial output. Asynchronous fmt::Write logs
+    /// remain immediate on VGA, but wait in fixed storage for a response gap.
+    #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+    pub fn defer_serial_logs(&mut self) {
+        self.defer_logs = true;
+    }
+
+    /// Drain logs only between shell responses, within the shared TX budget.
+    /// Yield input after each complete log line even if later logs remain.
+    /// False means the current bounded log line still owns serial framing.
+    #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+    pub fn drain_serial_logs(&mut self, budget: usize) -> bool {
+        for _ in 0..budget {
+            let Some(byte) = self.logs.peek() else { break };
+            if !self.try_serial_byte(byte) {
+                break;
+            }
+            self.logs.pop();
+            if byte == b'\n' {
+                return true;
+            }
+        }
+        self.logs.is_empty()
+    }
+
+    /// Terminal test exit has no next scheduler pass to drain its final log.
+    /// This is bounded by fixed queue storage and the existing per-byte wait;
+    /// normal runtime never calls this blocking path.
+    #[cfg(all(
+        feature = "fuzz-test",
+        not(any(feature = "smoke-test", feature = "userspace-test"))
+    ))]
+    pub fn flush_serial_logs_for_exit(&mut self) {
+        for _ in 0..8192 {
+            let Some(byte) = self.logs.peek() else { break };
+            self.serial_byte(byte);
+            self.logs.pop();
+        }
+    }
+
+    /// Try one raw byte without waiting. The shell supplies CRLF explicitly.
+    #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+    pub fn try_write_serial(&mut self, byte: u8) -> bool {
+        if !self.try_serial_byte(byte) {
+            return false;
+        }
+        self.vga_byte(byte);
+        true
+    }
+
+    #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+    fn try_serial_byte(&mut self, byte: u8) -> bool {
+        let status = self.serial_status();
+        if status == 0xff || status & 0x20 == 0 {
+            return false;
+        }
+        // SAFETY: the UART transmit holding register is ready.
+        unsafe {
+            outb(COM1, byte);
+        }
+        true
+    }
+
+    fn serial_byte(&mut self, byte: u8) {
         // Bound the wait so a missing or faulty UART cannot freeze VGA output.
         for _ in 0..100_000 {
-            // SAFETY: these are the PC UART's line-status and transmit ports.
-            unsafe {
-                if inb(COM1 + 5) & 0x20 != 0 {
+            let status = self.serial_status();
+            if status == 0xff {
+                return; // Missing COM1 must not delay every boot/VGA byte.
+            }
+            if status & 0x20 != 0 {
+                // SAFETY: the UART transmit holding register is ready.
+                unsafe {
                     outb(COM1, byte);
-                    return;
                 }
+                return;
             }
             core::hint::spin_loop();
         }

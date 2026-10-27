@@ -68,7 +68,8 @@ def launch_qemu(args: argparse.Namespace, serial_path: Path,
             port = reservation.getsockname()[1]
         command = [
             args.qemu,
-            "-machine", "q35", "-device", "intel-iommu,intremap=off",
+            "-machine", "q35", "-device",
+            "intel-iommu,intremap=" + ("on" if getattr(args, "interrupt_remapping", False) else "off"),
             "-accel", "tcg", "-cpu", getattr(args, "cpu", "max,-apic"),
             "-m", "128M",
             "-smp", "1",

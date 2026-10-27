@@ -182,7 +182,7 @@ impl E1000 {
         nic.write(RCTL, 0);
         nic.write(TCTL, 0);
         nic.read(STATUS); // Flush posted MMIO writes before reset.
-        clock.delay_micros(10_000);
+        clock.delay_micros(10_000)?;
         nic.write(CTRL, nic.read(CTRL) | CTRL_RESET);
         let deadline = clock.now_millis() + 100;
         while nic.read(CTRL) & CTRL_RESET != 0 {
@@ -191,7 +191,7 @@ impl E1000 {
             }
             core::hint::spin_loop();
         }
-        clock.delay_micros(10_000);
+        clock.delay_micros(10_000)?;
         nic.write(IMC, u32::MAX);
         nic.read(ICR);
         nic.mac = nic.read_mac(clock)?;

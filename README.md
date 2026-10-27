@@ -1,15 +1,18 @@
 # Rust kernel
 
-A small x86-64 kernel written in stable Rust that boots directly in QEMU.
-The normal build runs **three separate ring-3 services**: an HTTP server,
+A small x86-64 kernel written in stable Rust, with a QEMU development target
+and an experimental Intel/UEFI hardware port.
+The normal build runs **three separate ring-3 services per NIC**: an HTTP server,
 an allocation-free [smoltcp](https://docs.rs/smoltcp/0.14.0/smoltcp/) network
 service, and an Intel e1000 driver. The kernel provides address spaces,
 preemption, checked IPC, and a narrow VT-d device-assignment boundary.
 Ethernet packet handling, TCP/IP, and HTTP run outside ring 0.
 
-This is a fixed QEMU experiment, targeting **q35, one CPU, an e1000 on PCI root
-bus 0, and QEMU's Intel IOMMU**. It is not a general hardware driver framework,
-a guarantee about physical-device isolation, or a claim about VM host security.
+The default target is **q35, one CPU, an e1000 on PCI root bus 0, and QEMU's
+Intel IOMMU**. The separate [hardware port](docs/HARDWARE.md) adds UEFI/GRUB
+boot, firmware discovery, an APIC timer, and strict VT-d interrupt remapping.
+**Public production use is not approved**; see [security status](SECURITY.md).
+No physical machine has been qualified.
 
 ## Quick start
 
@@ -29,7 +32,7 @@ ELFs, then boots QEMU with serial output in your terminal. Press **Ctrl-a**,
 release both keys, then press **x** to exit. `make run-gui` also opens a VGA
 window; a graphical desktop and QEMU display backend are required.
 
-The production launch uses these required platform options:
+The default development launch uses these required platform options:
 
 ```text
 -machine q35 -device intel-iommu,intremap=off -cpu max,-apic -smp 1 -accel tcg
@@ -44,7 +47,7 @@ uses PIC/PIT scheduling interrupts instead. The reason is explained below.
 Startup messages identify the services and endpoints; their order can vary:
 
 ```text
-Isolation: three address spaces; bounded IPC; NIC DMA restricted by VT-d
+Isolation: three address spaces per NIC; private IPC and VT-d DMA domains
 Userspace network service: CPL=3
 e1000 driver: CPL=3, VT-d DMA grant active
 IPv4: 10.0.2.15/24, gateway 10.0.2.2
@@ -84,9 +87,10 @@ restarts can reset existing connections.
 
 ## Services and IPC
 
-Each service has its own CR3, physical backing, ELF image, stack, and saved
-extended CPU state. Their common virtual entry address does not imply shared
-memory.
+Each service instance has its own CR3, physical backing, ELF image, stack, and
+saved extended CPU state. Each NIC receives a separate group of driver, network,
+and web services. Their common virtual entry address does not imply shared
+memory. The following diagram shows one group; IPC never crosses groups.
 
 ```mermaid
 flowchart LR
@@ -104,12 +108,12 @@ flowchart LR
 | `build/nic-driver.elf` | e1000 register programming and RX/TX descriptors | Its assigned MMIO window, private DMA pool, and frame queues |
 
 The kernel never interprets Ethernet, IP, TCP, or HTTP packets in the normal
-build. It copies opaque frames through **two fixed queues**, one per direction,
+build. For each NIC it copies opaque frames through **two fixed queues**, one per direction,
 each holding **16 frames of at most 1514 bytes**. Full queues return `EAGAIN`.
 No service receives another service's pointers or direct access to its buffers.
 
 Socket RPC uses fixed `Request` and `Reply` records containing integers and at
-most 4096 payload bytes. One web request can be outstanding. The kernel checks
+most 4096 payload bytes. One web request per NIC can be outstanding. The kernel checks
 full user buffer ranges and read/write permissions before copying data or
 changing queue state. It issues monotonically increasing request-generation
 IDs, validates reply IDs and lengths, and rejects stale replies. An unanswered
@@ -136,6 +140,7 @@ passing another handle or syscall number cannot select another service's role.
 | 16 | Driver ready | NIC driver; request kernel-controlled bus-master enable |
 | 17 | MAC | Network service; read the driver-registered packed MAC |
 | 18 | Register MAC | NIC driver; publish a validated unicast MAC |
+| 19 | Random | Network service; fill exactly eight writable private bytes; hardware failure is an error |
 
 ## CPU, memory, and scheduling
 
@@ -155,8 +160,9 @@ XMM0–XMM15. Restarts clear that state as well as program memory. FXSR, SSE, an
 SSE2 support are required. OSXSAVE remains disabled: AVX/XSAVE instructions are
 not supported, even if the emulated CPU advertises wider vector capabilities.
 
-The system has exactly three embedded services on **one CPU**, without user
-threads or a general process-launching API. A 100 Hz PIT can preempt a process
+The system schedules up to eight groups of three services on **one CPU**,
+without user threads or a general process-launching API. A 100 Hz timer (PIT in development,
+local APIC in the hardware build) can preempt a process
 that never yields. Userspace runs with IF set and IOPL zero. The kernel handles
 traps and IPC with IF clear and bounds a service's syscall run to **64 calls or
 10 milliseconds**, checked between calls. Kernel operations are not themselves
@@ -165,13 +171,14 @@ a missed heartbeat triggers recovery.
 
 | Failure | Recovery |
 | --- | --- |
-| Web or network process fault/exit; network RPC timeout | Restart network and web, clear pending RPC and frame queues |
-| Driver fault/exit, heartbeat expiry, or detected DMA violation | Disable bus mastering, reset/quiesce NIC, revoke DMA mappings, then restart all services |
-| Device teardown or reassignment cannot be completed safely | Quarantine networking; do not resume device access |
+| Web or network process fault/exit; network RPC timeout | Restart that NIC’s network and web services; clear its pending RPC and frame queues |
+| Driver fault/exit, heartbeat expiry, or source-attributed DMA violation | Disable that NIC’s bus mastering, reset/quiesce it, revoke its DMA mappings, then restart its three services |
+| Device teardown cannot be completed safely | Quarantine that NIC; do not resume its device access |
+| Global IOMMU failure, fault overflow, or unknown fault source | Quarantine all NICs because isolation cannot be established |
 
 Restart delays back off from **100 ms to 6400 ms** for repeated failures.
-Connection state is discarded during dependent-service restarts, so clients
-must reconnect. Timer preemption, deadlines, queues, and restart supervision
+Connection state on the affected NIC is discarded during dependent-service
+restarts, so its clients must reconnect. Other NICs retain their connections. Timer preemption, deadlines, queues, and restart supervision
 bound resource use; they do not guarantee service availability against a
 malicious process or network peer.
 
@@ -181,27 +188,31 @@ The supported NIC is QEMU's **e1000 / Intel 82540EM** (`8086:100e`) directly on
 **PCI root bus 0**. `e1000e`, devices behind bridges, arbitrary requester aliases,
 and general PCI passthrough are outside this implementation.
 
-The driver maps a 128 KiB MMIO window at `0x50000000` and a permanently allocated
-**260 KiB (`0x41000`) DMA pool** at `0x50200000`. VT-d maps only that pool into the
-NIC's domain, starting at **IOVA `0x10000000`**. Other requesters and other IOVAs
-are denied; there is no DMA identity or pass-through domain. The pool contains
+Each driver maps its own 128 KiB MMIO window at `0x50000000` and a permanently
+allocated **260 KiB (`0x41000`) DMA pool** at `0x50200000`. VT-d gives each NIC a
+separate domain mapping only its pool, starting at **IOVA `0x10000000` plus
+`0x200000` per interface index**. Peer pools, unassigned requesters, and other
+IOVAs are denied; there is no DMA identity or pass-through domain. Each pool contains
 no kernel objects, stays pinned through resets, and is never reused as another
 process's memory. The driver uses 64 RX and 64 TX descriptors with fixed buffers.
 
 The kernel owns PCI assignment, VT-d tables, DMA grants/revocation, bus-master
 enable/disable, and reset sequencing. Ring-3 code owns normal e1000 operation.
 Device teardown stops bus mastering and resets/drains the device before
-revoking translations; failure leaves networking quarantined. Limited ACPI DMAR
-discovery supports this specific q35 setup, not arbitrary firmware platforms.
+revoking translations; failure leaves the affected NIC quarantined. Cache
+invalidations preserve other NICs’ mappings. ACPI discovery
+checks firmware memory ranges, checksums and table lengths. The supported DMAR
+shape remains narrow; see the hardware requirements before choosing a machine.
 
 DMA translation alone does **not** isolate QEMU's interrupt-message aperture.
 A malicious descriptor can target that aperture to synthesize interrupt messages.
-This build therefore requires **no local APIC device**, using
+The default development build therefore requires **no local APIC device**, using
 `-cpu max,-apic -smp 1`; merely clearing the APIC-enable bit is insufficient.
 PCI INTx is disabled, and the guest uses PIC/PIT for scheduling. This is a narrow
-QEMU-specific constraint, not a replacement for a general interrupt-remapping
-implementation. Missing VT-d, an APIC-present CPU, or unsupported device topology
-causes `Network isolation unavailable:` and refusal to start the services.
+QEMU-specific constraint. The separate `baremetal` feature requires a physical
+Intel platform with VT-d interrupt remapping, a nonpresent interrupt table, and
+compatibility forwarding disabled; it rejects advertised hypervisors. Missing
+required isolation or unsupported topology refuses to start the services.
 
 ## Networking
 
@@ -250,8 +261,10 @@ Existing connection traffic and echo do not spend HTTP admission tokens. Invalid
 IPv4/TCP checksums are rejected before SYN admission. Existing tuples take
 priority over free listeners so retransmission cannot create duplicate sockets.
 Clients behind one source address share its quota. These limits do not prevent
-distributed abuse, source spoofing, or link saturation. TCP sequence seeds use
-boot timing rather than cryptographic entropy.
+distributed abuse, source spoofing, or link saturation. Network startup and
+restart use bounded RDSEED/RDRAND access and refuse a missing or exhausted RNG;
+no clock-based fallback is used. smoltcp's internal sPCG generator remains
+non-cryptographic, so this does not establish secure TCP sequence generation.
 
 ## Commands and tests
 
@@ -263,7 +276,12 @@ boot timing rather than cryptographic entropy.
 | `make test-services` | Exercise the production service/DMA/IPC boundary and recovery |
 | `make test-userspace` | Run the separate legacy kernel WP/NX and ring-3 privilege baseline |
 | `make test-preemption` | Check TCP progress during busy and syscall-only web loops |
-| `make test-host` | Host admission and retransmitted-SYN dispatch regressions |
+| `make test-host` | Admission, network configuration, and firmware parser regressions |
+| `make iso` | GRUB Multiboot2 image for installed firmware platforms |
+| `make baremetal-iso` | Experimental Intel hardware image; explicit network settings required |
+| `make test-firmware` / `make test-apic` | UEFI handoff / local APIC preemption in QEMU |
+| `make test-deployment` | Custom subnet, echo disabled, RNG refusal |
+| `make audit` | RustSec checks of all locked dependencies |
 | `make test-abuse` | HTTP source quotas, half-open expiry, and recovery |
 | `make test-net` | Binary echo, socket/ring wrap, half-close, reconnect, and reset |
 | `make test-packets` | Raw Ethernet ARP, ICMP, and checksum rejection |
@@ -387,28 +405,33 @@ make fuzz-syscalls FUZZ_SEED=42 FUZZ_ITERATIONS=1000000 FUZZ_TIMEOUT=120
 ## Boot and source layout
 
 QEMU loads the flat `build/kernel.bin` through its Multiboot v1 address header.
-The kernel links at physical 1 MiB. Assembly clears BSS, establishes a 256 KiB
+GRUB loads the same image via its Multiboot2 header and supplies UEFI ACPI data.
+The hardware variant is built separately into `build/baremetal/`.
+The kernel links at physical 16 MiB. Assembly clears BSS, establishes a 256 KiB
 boot stack and initial 4 GiB identity map, then enters 64-bit mode. The first
 1 GiB is cached; the initial 1–4 GiB MMIO area is uncached. Kernel initialization
 installs descriptor tables, page permissions, stack guards, and the PIC/PIT.
 The service loader builds separate page-table roots with shared supervisor
-mappings and private user pages. The kernel loads three embedded ELF images;
+mappings and private user pages. The kernel loads the three embedded ELF images
+into a separate group for each assigned NIC;
 `objcopy` creates the boot image, not a disk image or ISO.
 
 | File | Purpose |
 | --- | --- |
 | `src/boot.S`, `src/main.rs` | Multiboot entry, long-mode bootstrap, checks, panic handler |
-| `src/console.rs` | VGA text and serial output |
+| `src/console.rs`, `src/shell.rs`, `src/shell_input.rs`, `src/serial_output.rs` | VGA/COM1 output, bounded serial commands, line editing and deferred log framing |
+| `src/nic.rs`, `userspace/network_config.rs` | Validated NIC commands and shared IPv4 configuration |
+| `src/setup.rs`, `src/setup_plan.rs` | Bounded JSON setup parser and whole-batch configuration preflight |
 | `src/net.rs` | Production service scheduler, capabilities, opaque frame queues, RPC broker, recovery |
 | `src/device.rs`, `src/pci.rs` | Narrow PCI assignment, private DMA lifetime, controlled reset/bus mastering |
-| `src/iommu.rs` | QEMU VT-d discovery, translation tables, faults, grant/revoke |
+| `src/iommu.rs` | VT-d DMA/interrupt tables, faults, grant/revoke, strict hardware guards |
 | `src/userspace.rs` | ELF loading, separate CR3 roots, checked copies, FXSAVE64 process state |
 | `src/memory.rs` | Kernel page permissions, stack guards, page-table audits |
 | `src/arch.rs`, `src/traps.S` | GDT/TSS/IDT, traps, IRQs, ring transitions |
-| `src/time.rs`, `src/timer.rs` | HPET clock and 100 Hz PIC/PIT preemption |
+| `src/platform.rs`, `src/time.rs`, `src/timer.rs` | Validated firmware discovery, HPET clock, PIT/APIC preemption |
 | `abi.rs` | Shared capability-based syscall and pointer-free RPC records |
 | `userspace/main.rs`, `userspace/http.rs`, `userspace/syscall.rs` | Web process, HTTP parser/page, socket wrappers |
-| `userspace/netd.rs`, `userspace/net_syscall.rs` | smoltcp service, echo, HTTP sockets, frame/RPC calls |
+| `userspace/netd.rs`, `userspace/net_syscall.rs`, `userspace/arp_announce.rs` | smoltcp service, echo, HTTP sockets, frame/RPC calls and bounded ARP announcements |
 | `src/abuse.rs` | Allocation-free HTTP admission/expiry code reused by netd and host tests |
 | `userspace/driver.rs`, `userspace/e1000.rs` | Ring-3 driver entry, MMIO, descriptors, packet I/O |
 | `userspace/linker.ld`, `userspace/services/Cargo.toml` | Separate service ELF layout and smoltcp build |
@@ -422,11 +445,13 @@ mappings and private user pages. The kernel loads three embedded ELF images;
 | `scripts/smoke_test.py` | Bounded bootstrap checks |
 
 The project has no heap allocator, filesystem, keyboard input, general process
-launcher, SMP support, or UEFI boot path. Networking is polled, so an idle guest
+launcher, or SMP support. UEFI boot is provided through GRUB/Multiboot2.
+Networking is polled, so an idle guest
 uses CPU time. CPU protection, the fixed DMA boundary, bounded IPC, quotas, and
 fuzz campaigns do not make it a production-hardened operating system. Static
-addressing, weak boot-time entropy, four HTTP slots, and lack of TLS remain
-intentional limitations.
+addressing, non-cryptographic TCP PRNG behavior, four HTTP slots per NIC, and lack of
+TLS remain limitations. Generic Intel hardware support is not implemented;
+see [the remaining compatibility work](docs/HARDWARE.md).
 
 References: [Rust bare-metal target](https://doc.rust-lang.org/rustc/platform-support/x86_64-unknown-none.html),
 [Multiboot specification](https://www.gnu.org/software/grub/manual/multiboot/multiboot.html),
@@ -434,3 +459,235 @@ References: [Rust bare-metal target](https://doc.rust-lang.org/rustc/platform-su
 [QEMU networking](https://www.qemu.org/docs/master/system/devices/net.html),
 [Intel system programming manuals](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html),
 [Intel 8254x manual](https://www.intel.com/content/dam/doc/manual/pci-pci-x-family-gbe-controllers-software-dev-manual.pdf).
+
+
+## Serial command line
+
+The kernel's COM1 console accepts commands at **115200 baud, 8 data bits,
+no parity, 1 stop bit, no flow control**. With `make run`, type commands directly
+into the existing serial terminal. QEMU's `Ctrl-a x` still exits that launcher.
+
+For a console you can detach and reconnect to, use two terminals:
+
+```sh
+# Terminal 1: start QEMU; COM1 listens only on localhost.
+make run-serial
+
+# Terminal 2: connect to the kernel shell.
+make console
+```
+
+The raw TCP endpoint defaults to `127.0.0.1:4444`. To choose another local port,
+pass the same value to both commands, for example
+`make run-serial SERIAL_PORT=4445` and `make console SERIAL_PORT=4445`.
+This launcher has no QEMU monitor. Stop it with `Ctrl-C` in the first terminal.
+
+The Python client needs only Python's standard library and a POSIX terminal.
+`Ctrl-]` detaches without stopping QEMU; run `make console` again to reconnect.
+`Ctrl-C` goes to the kernel and cancels the current command. The client restores
+terminal settings when it exits and paces pasted input for the UART's small
+FIFO. Boot output sent before a client attaches may be lost; press Enter to
+request a fresh `kernel> ` prompt.
+
+| Command | Result |
+| --- | --- |
+| `help` | List supported commands |
+| `pci` or `lspci` | List PCI segment 0 devices, including BDF and vendor/device IDs |
+| `pci net` | List network controllers; QEMU e1000 appears as `8086:100e` |
+| `uptime` | Show elapsed time |
+| `nic` or `nic show` | Show the selected NIC's state, IPv4/prefix, gateway, echo setting, MAC, PCI BDF, and link state |
+| `nic list` | List e1000 adapters, their independent states, and the console selection |
+| `nic select ethN` | Choose the adapter to configure; all other adapters keep running |
+| `nic set ADDRESS/PREFIX GATEWAY\|none [echo on\|off]` | Apply a static network configuration to the selected adapter |
+| `nic down` | Stop only the selected adapter’s services and DMA |
+| `nic up` | Restart the selected adapter when its device isolation remains available |
+| `setup` or `setup help` | Show the JSON configuration schema |
+| `setup show` | Export all detected interfaces as one JSON document |
+| `setup {"system":[...]}` | Validate and apply settings to the named interfaces |
+
+Each NIC keeps its own settings until reboot; the build-time `KERNEL_IPV4`, `KERNEL_PREFIX`,
+`KERNEL_GATEWAY`, and `KERNEL_ECHO` values supply the next boot's defaults.
+The default build starts at `10.0.2.15/24` with gateway `10.0.2.2` and echo on.
+For example, enter these commands at `kernel> ` to disable the echo service
+while retaining HTTP, then stop and restart that adapter:
+
+```text
+nic show
+nic set 10.0.2.15/24 10.0.2.2 echo off
+nic down
+nic up
+```
+
+`nic set` checks the entire command before changing anything. An invalid
+address, prefix, gateway, or echo option leaves the running configuration
+unchanged. Use a unicast host address and a distinct gateway in the same subnet,
+or `none` for no default route. Omitting `echo on|off` preserves its current
+value. Applying a configuration restarts that adapter's services and resets its
+connections; `nic down` also stops only its web and network services. Other
+adapters and their established connections continue running. Changing a stopped
+NIC saves the new settings while leaving it stopped until `nic up`.
+`nic up` cannot override a failed isolation check or a quarantined device. Use
+`setup` below to change the MAC address; `nic set` preserves it. There is no DHCP
+client.
+
+Use `setup` to configure one or more interfaces in a single serial command.
+Paste the entire JSON document on **one line**, after `setup`:
+
+```text
+setup {"system":[{"Interface":"eth0","PCI":"0000:00:02.0","MAC":"52:54:00:12:34:56","IPv4":"10.0.2.15/24","Gateway":"10.0.2.2","Echo":false,"Enabled":true},{"Interface":"eth1","PCI":"0000:00:03.0","MAC":"52:54:00:12:34:57","IPv4":"10.0.2.15/24","Gateway":"10.0.2.2","Echo":true,"Enabled":true}]}
+setup show
+```
+
+`Interface` or `PCI` selects an existing adapter independently of `nic select`;
+each object must also contain at least one setting. When both selectors are
+present, they must identify the same adapter. `PCI` is a hardware identity, not a
+writable address: it cannot move a NIC, rebind an interface name, or attach an
+unsupported device. The top-level `system` array accepts one to eight objects,
+with each adapter appearing once, even when selected by different names. Field
+names are case-sensitive.
+
+| Setting | JSON value | Meaning |
+| --- | --- | --- |
+| `Interface` | `"eth0"` through `"eth7"` | Name of a detected adapter; optional when `PCI` is supplied |
+| `PCI` | `"0000:00:02.0"` | Exact PCI segment:bus:device.function identity of a detected adapter |
+| `MAC` | `"52:54:00:12:34:56"` | Six colon-separated hexadecimal octets; must be nonzero and unicast |
+| `IPv4` | `"10.0.2.15/24"` or `"10.0.2.15"` | Static host address; a bare address preserves the current prefix |
+| `Prefix` | `24` | Optional integer prefix from 1 to 32; if IPv4 includes a prefix, the values must agree |
+| `Gateway` | `"10.0.2.2"`, `"none"`, or `null` | Default gateway on the same subnet, or no default route |
+| `Echo` | `true` or `false` | Enable or disable TCP echo on port 1234 |
+| `Enabled` | `true` or `false` | Start or stop this interface's services and DMA |
+
+Omitted settings keep their current value for that interface. For example,
+`setup {"system":[{"Interface":"eth1","Echo":false}]}` disables only eth1's echo
+service and preserves its address, gateway, and enabled state. `setup show`
+exports every detected adapter with its PCI identity, current MAC when known,
+an IPv4 CIDR string, and explicit gateway, echo, and enabled values. Hexadecimal
+identities are exported in lowercase. Its JSON can be prefixed with `setup ` and
+pasted back when at least one interface is present; unchanged settings do not restart
+services. Output is a configuration export, not a persistent file.
+
+For example, configure eth1 by PCI identity and set its MAC address:
+
+```text
+setup {"system":[{"PCI":"0000:00:03.0","MAC":"52:54:00:ab:cd:67","IPv4":"10.0.2.16/24"}]}
+```
+
+A MAC change programs the e1000 receive filter and the network stack's packet
+source address. It survives `nic set`, down/up, and service restarts until reboot.
+Omitting `MAC` preserves it; `null` does not reset it. Final configured MACs must
+be distinct across all detected interfaces, including stopped and untouched
+adapters. One batch may swap two MACs. The stack sends ARP announcements after
+starting to refresh peers after a MAC change; peers with static ARP entries need
+an administrator to update them. Choose addresses that are also unique on the
+physical network.
+
+The whole request is parsed and all named interfaces and resulting settings
+are checked before any changes begin. Invalid addresses, unavailable interfaces,
+mismatched Interface/PCI selectors, invalid or duplicate resulting MACs,
+duplicate keys or interfaces, unknown fields, incorrect JSON types, malformed
+JSON, and trailing input reject the entire request. A hardware failure while
+applying a validated batch stops affected devices safely; this is not a promise
+of atomic rollback after a hardware failure. Changes that restart an interface
+reset its connections; other interfaces continue running. Setup cannot bypass
+isolation checks or quarantine. Settings remain in memory until reboot. There
+is no DHCP, DNS, web-port, or filesystem configuration in this schema.
+
+The kernel can run up to eight supported root-bus e1000 adapters simultaneously,
+named `eth0` through `eth7` in PCI BDF order. Each adapter has its own driver,
+TCP/IP stack, web server, DMA allocation, and network configuration. All eligible
+adapters start enabled. `nic select eth1` changes only which adapter the console
+commands configure; it does not reset connections or change any adapter's up/down
+state. `nic show`, `nic set`, `nic up`, and `nic down` apply to that selection.
+Invalid selections leave the selection unchanged. A quarantined adapter cannot
+be enabled through selection or `nic up`; healthy adapters continue separately.
+Names follow the discovered PCI topology, so hardware changes can change names
+on a subsequent boot. The kernel does not route or bridge packets between NICs.
+
+The same build-time defaults apply to every adapter. On physical networks,
+configure an appropriate address and gateway on each interface; avoid duplicate
+addresses when interfaces share the same network. The QEMU example below uses
+separate networks, so both NICs can use the same default address safely.
+
+To try two distinguishable adapters in QEMU:
+
+```sh
+make run-multi-nic
+# Or: make run-multi-nic-serial, then make console in another terminal.
+```
+
+| Interface | PCI BDF | MAC | Local HTTP port | Local echo port |
+| --- | --- | --- | --- | --- |
+| `eth0` | `0000:00:02.0` | `52:54:00:12:34:56` | `8080` | `5555` |
+| `eth1` | `0000:00:03.0` | `52:54:00:12:34:57` | `8081` | `5556` |
+
+Both adapters use separate QEMU user networks with the same default guest IP,
+`10.0.2.15`. Both `curl http://localhost:8080/healthz` and
+`curl http://localhost:8081/healthz` work at the same time. Enter `nic list` to
+see both states. Use `nic select eth1` followed by `nic down` to stop only the
+second adapter; the first adapter continues serving HTTP on port 8080. Restore
+the second adapter with `nic up`. Override ports
+with `HTTP_PORT`, `HTTP_PORT_1`, `HOST_PORT`, and `HOST_PORT_1`; the serial variant
+also accepts `SERIAL_PORT`. Every supplied forward binds to `127.0.0.1`.
+Use `QEMU_MULTI_NET` to replace the two-adapter network arguments if needed.
+
+QEMU host forwards retain their configured guest destination. If you change
+the guest IP, provide matching `QEMU_NET` (or `QEMU_MULTI_NET`) forwards when starting QEMU; the
+usual `localhost:8080` forward still points to `10.0.2.15`.
+
+PCI output includes the 24-bit class code and the raw 32-bit BAR0 register,
+including its flag bits. It does not decode a complete 64-bit BAR address.
+
+For example, the supplied QEMU configuration reports:
+
+```text
+0000:00:02.0 8086:100e     020000 feb80000   Intel 82540EM / e1000 NIC
+```
+
+BDF and BAR values depend on the machine configuration.
+
+On a physical machine, this console requires a firmware-enabled, legacy
+16550-compatible COM1 UART at I/O port `0x3f8`. Connect a host serial port or
+USB-to-serial adapter with a null-modem cable as appropriate for the hardware,
+and select the settings above in the host terminal. The kernel does not discover
+USB UARTs, MMIO UARTs, or alternative ports described by ACPI SPCR. This does not
+extend the project's current hardware compatibility claims.
+
+Lines are limited to 2048 bytes, including the command and JSON. Backspace and
+Delete erase input; CR, LF, and CRLF submit a line. An overlong line is rejected in full, and `Ctrl-C` cancels
+input. The shell remains available when networking refuses startup, so PCI
+inspection does not depend on a running NIC or web service. Asynchronous service
+logs wait between complete console responses so they cannot split exported JSON.
+Log storage and line lengths are bounded; dropped or truncated logs have visible
+markers, and continuous logging yields to console input.
+
+`make test-serial` checks command output, editing, corrupt/overlong input,
+PCI filtering and cancellation, reconnection, and HTTP health while commands
+run. It also checks live IP/gateway/echo changes through separate QEMU forwards,
+invalid-setting rejection, down/up recovery, and continued refusal of NIC
+changes after IOMMU-related startup failure. `make test-multi-nic` additionally
+checks simultaneous HTTP and echo service, separate adapter identities, and
+held TCP streams surviving changes to the console selection. It changes and
+stops one NIC while checking uninterrupted established TCP and HTTP traffic on
+the other. `make test-setup` checks JSON export, independent and batched settings,
+whole-batch rejection with both original TCP streams held open, overlong input,
+and startup isolation refusal. It also checks PCI selectors, MAC collision
+rejection and coordinated swaps, MAC preservation through down/up and `nic set`,
+MAC-only changes with an existing peer ARP entry, and the new MAC in captured
+ARP announcements and HTTP packets in both directions. These tests
+use temporary loopback ports and private packet captures.
+`make test-multi-nic-guards` uses
+offline NICs and private UNIX sockets to verify excess-inventory refusal, bridge
+exclusion, and eight active adapters with independent down/up, including actual
+PCI bus-master bits. These checks are included in `make test`.
+
+`make test-multi-nic-isolation` runs real cross-interface CPU and DMA fault
+probes while the peer NIC keeps an established TCP stream and serves HTTP; it
+is also included in `make test`. `make test-multi-nic-shared-failure` separately
+injects a test-only shared IOMMU failure, verifies that both NICs have bus
+mastering disabled, and checks that console commands, including JSON setup,
+cannot bypass quarantine.
+That injection exercises the failure policy; it does not emulate a hardware
+invalidation timeout.
+
+The TCP serial transport provides no authentication or encryption; the supplied
+launcher binds only to localhost.

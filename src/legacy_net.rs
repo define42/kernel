@@ -114,8 +114,13 @@ pub fn run(console: &mut Console) -> ! {
             crate::halt();
         }
     };
-    crate::timer::init();
-    writeln!(console, "Timer: PIT 100 Hz; preemptive user scheduling").ok();
+    crate::timer::init(&clock).expect("preemption timer");
+    writeln!(
+        console,
+        "Timer: {} 100 Hz; preemptive user scheduling",
+        crate::timer::BACKEND
+    )
+    .ok();
     let nic = match E1000::init(&clock) {
         Ok(nic) => nic,
         Err(error) => {

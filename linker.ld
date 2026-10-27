@@ -11,7 +11,9 @@ PHDRS
 
 SECTIONS
 {
-    . = 1M;
+    /* Avoid the low-memory ACPI NVS holes used by UEFI firmware. The
+       complete range is still checked against the loader memory map. */
+    . = 16M;
     __kernel_start = .;
 
     .multiboot ALIGN(4) :
@@ -66,10 +68,10 @@ SECTIONS
         *(.comment .note .note.*)
     }
 
-    ASSERT(SIZEOF(.multiboot) == 32, "Unexpected Multiboot header layout")
+    ASSERT(SIZEOF(.multiboot) >= 32, "Missing Multiboot headers")
     ASSERT(ADDR(.multiboot) - __kernel_start + SIZEOF(.multiboot) <= 8192,
            "Multiboot header must be inside the first 8 KiB")
     ASSERT((ADDR(.multiboot) & 3) == 0, "Multiboot header must be aligned")
     ASSERT(((__bss_end - __bss_start) & 3) == 0, "BSS must contain whole dwords")
-    ASSERT(__kernel_end <= 0x02000000, "Kernel exceeds the 32 MiB protected-page-table capacity")
+    ASSERT(__kernel_end <= 0x08000000, "Kernel exceeds the 128 MiB protected-page-table capacity")
 }

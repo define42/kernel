@@ -189,12 +189,31 @@ class Client:
                 return tcp
         return None
 
+    def begin_handshake(self, seconds=2):
+        # Keep one tuple/ISN and a fixed total deadline. A SYN sent immediately
+        # after other clients' RSTs can precede userspace listener rearming;
+        # neighbor discovery can also delay its response. Retransmit the exact
+        # segment as TCP does, without consuming another sequence number.
+        options = b"\x02\x04\x05\xb4"
+        syn = tcp_frame(self.source, self.port, self.destination, self.sequence,
+                        self.ack, 2, options=options)
+        deadline = time.monotonic() + seconds
+        self.send(2, options=options)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("TCP handshake failed: SYN-ACK deadline")
+            reply = self.receive(min(0.5, remaining))
+            if reply is not None:
+                if reply[4] & 0x12 != 0x12 or reply[4] & 4 or reply[3] != self.sequence:
+                    raise RuntimeError(f"TCP handshake failed: {reply!r}")
+                self.ack = (reply[2] + 1) & 0xffffffff
+                return  # Deliberately no ACK: callers may test a half-open socket.
+            if time.monotonic() < deadline:
+                self.lab.send(syn, "syn-retransmit")
+
     def open(self):
-        self.send(2, options=b"\x02\x04\x05\xb4")
-        reply = self.receive()
-        if reply is None or reply[4] & 0x12 != 0x12 or reply[3] != self.sequence:
-            raise RuntimeError(f"TCP handshake failed: {reply!r}")
-        self.ack = (reply[2] + 1) & 0xffffffff
+        self.begin_handshake()
         self.send(16)
 
     def collect(self, seconds=2, allow_reset=False):

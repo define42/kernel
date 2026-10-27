@@ -13,6 +13,8 @@ userspace-test = ["dep:smoltcp"]
 preemption-test = []
 fuzz-test = []
 isolation-test = []
+# Experimental physical Intel platform path; not a production certification.
+baremetal = []
 
 [[bin]]
 name = "kernel"

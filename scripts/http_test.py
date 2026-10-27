@@ -17,7 +17,7 @@ from network_test import (check_process, positive_timeout, remaining, show_logs,
 
 
 USERSPACE_MARKER = b"Userspace web server: CPL=3"
-READY_MARKER = b"HTTP listening on 10.0.2.15:80"
+READY_MARKER = b"HTTP listening on port 80"
 MAX_RESPONSE = 65536
 REQUEST = b"GET /healthz HTTP/1.1\r\nHost: kernel\r\n\r\n"
 

@@ -16,7 +16,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 const PAGE_SIZE: u64 = 4096;
 const HUGE_SIZE: u64 = 2 * 1024 * 1024;
 const IDENTITY_END: u64 = 1 << 32;
-const SPLIT_TABLES: usize = 16;
+// Eight isolated three-process interface groups have 48 MiB of private
+// backing, plus pinned DMA pools and kernel data, loaded starting at 16 MiB.
+// Keep every resident page covered by the same 4 KiB permission policy.
+const SPLIT_TABLES: usize = 64;
 const KERNEL_LIMIT: u64 = SPLIT_TABLES as u64 * HUGE_SIZE;
 const PRESENT: u64 = 1;
 const WRITABLE: u64 = 1 << 1;

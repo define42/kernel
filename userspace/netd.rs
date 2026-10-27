@@ -7,7 +7,9 @@
 mod abi;
 #[path = "../src/abuse.rs"]
 mod abuse;
+mod arp_announce;
 mod net_syscall;
+mod network_config;
 
 use core::arch::asm;
 use core::fmt::{self, Write};
@@ -17,7 +19,9 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
+
+use network_config::NetworkConfig;
 
 const FRAME_SIZE: usize = 1514;
 const ECHO_BUFFER_SIZE: usize = 16 * 1024;
@@ -31,7 +35,8 @@ struct Buffers {
     http_transmit: [[u8; abi::SOCKET_BUFFER_SIZE]; abi::SOCKET_COUNT],
 }
 
-// These 64 KiB of process-private buffers live in BSS, not on the user stack.
+// These process-private buffers live in BSS, not on the user stack. Keep echo
+// buffers allocated so runtime configuration can enable it on a later restart.
 static mut BUFFERS: Buffers = Buffers {
     echo_receive: [0; ECHO_BUFFER_SIZE],
     echo_transmit: [0; ECHO_BUFFER_SIZE],
@@ -110,7 +115,7 @@ impl phy::TxToken for TransmitToken {
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
-pub extern "C" fn _start(mode: u64, seed: u64, _iterations: u64) -> ! {
+pub extern "C" fn _start(mode: u64, _seed: u64, _iterations: u64) -> ! {
     let code_segment: u16;
     // SAFETY: CS is readable at every privilege level.
     unsafe {
@@ -121,6 +126,33 @@ pub extern "C" fn _start(mode: u64, seed: u64, _iterations: u64) -> ! {
     if mode == 1 {
         check_ipc_boundaries();
     }
+    // Fetch on every process start/restart. A failed or malformed response
+    // cannot silently reuse a compiled or stale network configuration.
+    let network = match net_syscall::network_config() {
+        Ok(config) => config,
+        Err(error) => {
+            writeln!(
+                Logger,
+                "Network configuration unavailable: {error}; refusing startup"
+            )
+            .ok();
+            net_syscall::exit(1);
+        }
+    };
+    // Every interface, including supervisor restarts, receives a fresh
+    // hardware-backed seed. Clock values and fixed test seeds are not fallback
+    // entropy. smoltcp's internal PRNG remains non-cryptographic.
+    let seed = match net_syscall::random_seed() {
+        Ok(seed) => seed,
+        Err(error) => {
+            writeln!(
+                Logger,
+                "Network entropy unavailable: {error}; refusing startup"
+            )
+            .ok();
+            net_syscall::exit(1);
+        }
+    };
     let mac = loop {
         match net_syscall::mac() {
             Ok(mac) => break EthernetAddress(mac),
@@ -131,10 +163,10 @@ pub extern "C" fn _start(mode: u64, seed: u64, _iterations: u64) -> ! {
     let mut device = EthernetDevice {
         receive_buffer: [0; FRAME_SIZE],
         pending_receive: None,
-        guard: abuse::Guard::new(),
+        guard: abuse::Guard::for_address(Ipv4Address::from(network.address)),
     };
     let mut config = Config::new(mac.into());
-    config.random_seed = seed ^ net_syscall::now_millis() as u64;
+    config.random_seed = seed;
     let mut interface = Interface::new(
         config,
         &mut device,
@@ -142,28 +174,37 @@ pub extern "C" fn _start(mode: u64, seed: u64, _iterations: u64) -> ! {
     );
     interface.update_ip_addrs(|addresses| {
         addresses
-            .push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24))
+            .push(IpCidr::new(
+                Ipv4Address::from(network.address).into(),
+                network.prefix,
+            ))
             .unwrap();
     });
-    interface
-        .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2))
-        .unwrap();
+    if let Some(gateway) = network.gateway {
+        interface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::from(gateway))
+            .unwrap();
+    }
 
     // SAFETY: _start is entered once in this single-threaded process. The
     // supervisor restores this process's private image on every restart.
     let buffers = unsafe { &mut *core::ptr::addr_of_mut!(BUFFERS) };
-    let mut echo = tcp::Socket::new(
-        tcp::SocketBuffer::new(&mut buffers.echo_receive[..]),
-        tcp::SocketBuffer::new(&mut buffers.echo_transmit[..]),
-    );
-    echo.set_timeout(Some(Duration::from_secs(30)));
-    echo.set_keep_alive(Some(Duration::from_secs(10)));
-    echo.listen(ECHO_PORT).unwrap();
     let mut storage = [const { SocketStorage::EMPTY }; 1 + abi::SOCKET_COUNT];
     let mut sockets = SocketSet::new(&mut storage[..]);
-    let echo_handle = sockets.add(echo);
-    let mut handles = [echo_handle; abi::SOCKET_COUNT];
+    let echo_handle = if network.echo {
+        let mut echo = tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut buffers.echo_receive[..]),
+            tcp::SocketBuffer::new(&mut buffers.echo_transmit[..]),
+        );
+        echo.set_timeout(Some(Duration::from_secs(30)));
+        echo.set_keep_alive(Some(Duration::from_secs(10)));
+        echo.listen(ECHO_PORT).unwrap();
+        Some(sockets.add(echo))
+    } else {
+        None
+    };
+    let mut handles = [SocketHandle::default(); abi::SOCKET_COUNT];
     for (index, (receive, transmit)) in buffers
         .http_receive
         .iter_mut()
@@ -199,13 +240,33 @@ pub extern "C" fn _start(mode: u64, seed: u64, _iterations: u64) -> ! {
         ReplyProbe::Disabled
     };
 
-    net_syscall::log("IPv4: 10.0.2.15/24, gateway 10.0.2.2\n");
-    net_syscall::log("TCP echo listening on 10.0.2.15:1234\n");
-    net_syscall::log("Host: connect to 127.0.0.1:5555 (make run default)\n");
-    net_syscall::log("Web: http://127.0.0.1:8080/ (make run default)\n");
-    net_syscall::log("Polling network. Use Ctrl-a x to exit QEMU.\n");
+    let address = Ipv4Address::from(network.address);
+    match network.gateway {
+        Some(gateway) => writeln!(
+            Logger,
+            "IPv4: {address}/{}, gateway {}",
+            network.prefix,
+            Ipv4Address::from(gateway)
+        )
+        .ok(),
+        None => writeln!(
+            Logger,
+            "IPv4: {address}/{}, no default gateway",
+            network.prefix
+        )
+        .ok(),
+    };
+    if network.echo {
+        writeln!(Logger, "TCP echo listening on {address}:{ECHO_PORT}").ok();
+    } else {
+        net_syscall::log("TCP echo disabled\n");
+    }
+    let mut announcements =
+        arp_announce::Announcements::new(mac, address, net_syscall::now_millis());
+    net_syscall::log("Polling network.\n");
     loop {
         let now = Instant::from_millis(net_syscall::now_millis());
+        announcements.poll(now.total_millis(), net_syscall::send_frame);
         device
             .guard
             .expire(&mut sockets, &handles, now.total_millis());
@@ -232,10 +293,9 @@ pub extern "C" fn _start(mode: u64, seed: u64, _iterations: u64) -> ! {
                     .unwrap();
             }
         }
-        poll_echo(
-            sockets.get_mut::<tcp::Socket>(echo_handle),
-            &mut echo_buffer,
-        );
+        if let Some(handle) = echo_handle {
+            poll_echo(sockets.get_mut::<tcp::Socket>(handle), &mut echo_buffer);
+        }
         service_requests(
             &mut sockets,
             &handles,
@@ -259,6 +319,46 @@ fn check_ipc_boundaries() {
     // SAFETY: denied capabilities and invalid ranges must be rejected by the
     // kernel before access. Calls with valid buffers keep those buffers live.
     unsafe {
+        for invalid in [0, 0x10_0000, readonly, abi::DRIVER_DMA] {
+            assert_eq!(
+                net_syscall::raw(abi::SYS_RANDOM, invalid, 8, 0),
+                abi::EFAULT
+            );
+        }
+        for length in [0, 7, 9, u64::MAX] {
+            assert_eq!(
+                net_syscall::raw(abi::SYS_RANDOM, address, length, 0),
+                abi::EINVAL
+            );
+        }
+        assert_eq!(
+            net_syscall::raw(abi::SYS_RANDOM, address, 8, 1),
+            abi::EINVAL
+        );
+        for invalid in [
+            0,
+            0x10_0000,
+            readonly,
+            abi::DRIVER_MMIO,
+            abi::DRIVER_DMA,
+            0x401f_fff8,
+            u64::MAX - 7,
+        ] {
+            assert_eq!(
+                net_syscall::raw(abi::SYS_NET_CONFIG, invalid, abi::NET_CONFIG_SIZE as u64, 0),
+                abi::EFAULT
+            );
+        }
+        for length in [0, 15, 17, u64::MAX] {
+            assert_eq!(
+                net_syscall::raw(abi::SYS_NET_CONFIG, address, length, 0),
+                abi::EINVAL
+            );
+        }
+        assert_eq!(
+            net_syscall::raw(abi::SYS_NET_CONFIG, address, abi::NET_CONFIG_SIZE as u64, 1),
+            abi::EINVAL
+        );
         for operation in [
             abi::SYS_DRIVER_READY,
             abi::SYS_DRIVER_RX,
@@ -337,6 +437,28 @@ fn check_ipc_boundaries() {
         canary.iter().all(|byte| *byte == 0xa5),
         "IPC probe overwrote its canary"
     );
+    // The successful getter writes exactly its sixteen-byte output, even
+    // when the surrounding writable user allocation is larger.
+    unsafe {
+        assert_eq!(
+            net_syscall::raw(
+                abi::SYS_NET_CONFIG,
+                address + 8,
+                abi::NET_CONFIG_SIZE as u64,
+                0
+            ),
+            0
+        );
+    }
+    assert!(
+        canary[..8]
+            .iter()
+            .chain(&canary[24..])
+            .all(|byte| *byte == 0xa5)
+    );
+    let wire: [u8; abi::NET_CONFIG_SIZE] = canary[8..24].try_into().unwrap();
+    let config = NetworkConfig::from_wire(wire).expect("invalid kernel network configuration");
+    assert_eq!(config.to_wire(), wire);
     net_syscall::log("Network IPC validation checks passed.\n");
 }
 

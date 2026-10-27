@@ -146,6 +146,16 @@ arch_unexpected:
     jmp arch_trap_common
 .size arch_unexpected, . - arch_unexpected
 
+# Local APIC spurious interrupts never set an ISR bit and need no EOI.
+# Internal sentinel 256 keeps them distinct from unexpected-vector faults.
+.global arch_spurious
+.type arch_spurious,@function
+arch_spurious:
+    push 0
+    push 256
+    jmp arch_trap_common
+.size arch_spurious, . - arch_spurious
+
 .type arch_trap_common,@function
 arch_trap_common:
     push rax
@@ -176,6 +186,8 @@ arch_trap_common:
     mov ss, ax
 
     mov rax, [rsp + 120]
+    cmp eax, 256
+    je .Lreturn_interrupt
     cmp eax, 32
     je .Ltimer_irq
     cmp eax, 33
@@ -209,11 +221,18 @@ arch_trap_common:
     ret
 
 .Ltimer_irq:
-    # Acknowledge only master IRQ0 with a specific EOI. The locked increment
-    # matches the AtomicU64 reader in timer.rs, including on a future SMP CPU.
+    # All registers are saved. The sole boot CPU publishes its supervisor
+    # APIC EOI address before enabling the local timer; zero selects PIC IRQ0.
     lock inc qword ptr [rip + TIMER_TICKS]
+    mov rax, [rip + TIMER_APIC_EOI]
+    test rax, rax
+    jz .Ltimer_pic_eoi
+    mov dword ptr [rax], 0
+    jmp .Ltimer_acknowledged
+.Ltimer_pic_eoi:
     mov al, 0x60
     out 0x20, al
+.Ltimer_acknowledged:
     test byte ptr [rsp + 144], 3
     jnz .Ldeliver_context
     # IF is normally zero in ring 0. If an IRQ nevertheless interrupted it,
@@ -221,6 +240,14 @@ arch_trap_common:
     jmp .Lreturn_interrupt
 
 .Lother_irq:
+    # The local APIC backend masks all other LVTs and legacy PIC inputs. If
+    # a stale external vector survives, acknowledge its controller and resume.
+    mov rdx, [rip + TIMER_APIC_EOI]
+    test rdx, rdx
+    jz .Lother_pic_irq
+    mov dword ptr [rdx], 0
+    jmp .Lreturn_interrupt
+.Lother_pic_irq:
     # All other PIC inputs are masked. If a pending or spurious interrupt
     # survives initialization, acknowledge it correctly and resume directly.
     cmp eax, 39
@@ -296,9 +323,11 @@ arch_trap_common:
 .Lreturn_interrupt:
     test byte ptr [rsp + 144], 3
     jz .Lrestore_registers
-    mov ax, 0x1b
-    mov ds, ax
-    mov es, ax
+    # Even an ignored IRQ cannot IRET directly to an untrusted user RSP: it
+    # might be noncanonical and fault in ring 0. Yield without a timer tick;
+    # the scheduler's normal resume path validates and sanitizes the frame.
+    mov qword ptr [rsp + 120], 32
+    jmp .Ldeliver_context
 .Lrestore_registers:
     pop r15
     pop r14
@@ -320,6 +349,27 @@ arch_trap_common:
 .size arch_trap_common, . - arch_trap_common
 
 .if {test_probes}
+.global arch_probe_spurious
+.type arch_probe_spurious,@function
+arch_probe_spurious:
+    # Build an interrupted user frame without entering untrusted memory. This
+    # exercises spurious-IRQ return with an adversarial, noncanonical user RSP.
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [rip + arch_kernel_rsp], rsp
+    mov [rip + arch_active_context], rdi
+    push qword ptr [rdi + 168]
+    push qword ptr [rdi + 160]
+    push qword ptr [rdi + 152]
+    push qword ptr [rdi + 144]
+    push qword ptr [rdi + 136]
+    jmp arch_spurious
+.size arch_probe_spurious, . - arch_probe_spurious
+
 .global arch_probe_write
 .type arch_probe_write,@function
 arch_probe_write:

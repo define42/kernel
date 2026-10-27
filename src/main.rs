@@ -22,8 +22,23 @@ mod memory;
 mod net;
 #[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
 mod net;
+#[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+#[path = "../userspace/network_config.rs"]
+mod network_config;
+#[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+mod nic;
 #[cfg(not(feature = "smoke-test"))]
 mod pci;
+#[cfg_attr(feature = "smoke-test", allow(dead_code))]
+mod platform;
+#[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+mod setup;
+#[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+mod setup_plan;
+#[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+mod shell;
+#[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+mod shell_input;
 #[cfg(all(not(feature = "smoke-test"), feature = "userspace-test"))]
 mod syscall;
 #[cfg(not(feature = "smoke-test"))]
@@ -43,18 +58,6 @@ use console::Console;
 
 global_asm!(include_str!("boot.S"));
 
-const MULTIBOOT_MAGIC: u32 = 0x2bad_b002;
-const IDENTITY_MAP_END: u32 = 1 << 30;
-
-/// The fixed prefix of the Multiboot v1 information structure.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct BootInfo {
-    flags: u32,
-    mem_lower_kib: u32,
-    mem_upper_kib: u32,
-}
-
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main(magic: u32, info_addr: u32) -> ! {
     // The bootstrap starts just one CPU and leaves interrupts disabled. This
@@ -63,28 +66,23 @@ extern "C" fn kernel_main(magic: u32, info_addr: u32) -> ! {
     writeln!(console, "Rust kernel").ok();
     writeln!(console, "===========").ok();
 
-    assert_eq!(magic, MULTIBOOT_MAGIC, "invalid Multiboot boot magic");
-    assert!(
-        info_addr != 0
-            && info_addr.is_multiple_of(4)
-            && info_addr <= IDENTITY_MAP_END - size_of::<BootInfo>() as u32,
-        "boot information is outside the identity map"
-    );
-    // SAFETY: the trusted Multiboot loader supplies this aligned structure;
-    // the range check above ensures its entire prefix is identity mapped.
-    let info = unsafe { (info_addr as *const BootInfo).read() };
-
+    let boot = platform::init(magic, info_addr).expect("boot platform validation");
     writeln!(console, "CPU: x86-64 (long mode)").ok();
     writeln!(console, "Paging: 4 GiB identity mapped (PCI MMIO uncached)").ok();
-    if info.flags & 1 != 0 {
+    writeln!(
+        console,
+        "Multiboot{}: {} memory regions; resident kernel {} KiB in available RAM",
+        boot.version,
+        boot.memory_regions,
+        boot.kernel_bytes.div_ceil(1024)
+    )
+    .ok();
+    if let Some(address) = boot.hpet {
         writeln!(
             console,
-            "Memory: {} KiB conventional, {} KiB above 1 MiB",
-            info.mem_lower_kib, info.mem_upper_kib
+            "ACPI: validated firmware tables; HPET at {address:#x}"
         )
         .ok();
-    } else {
-        writeln!(console, "Memory: size not provided by the bootloader").ok();
     }
     writeln!(console, "Kernel booted successfully.").ok();
 

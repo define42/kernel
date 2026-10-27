@@ -47,10 +47,21 @@ pub const SYS_DRIVER_TX: u64 = 15;
 pub const SYS_DRIVER_READY: u64 = 16;
 pub const SYS_MAC: u64 = 17;
 pub const SYS_MAC_REGISTER: u64 = 18;
+/// NETWORK only: fill exactly eight writable user bytes, or return an error.
+pub const SYS_RANDOM: u64 = 19;
+/// NETWORK only: copy the current canonical network configuration into exactly
+/// sixteen writable user bytes. The third argument must be zero.
+pub const SYS_NET_CONFIG: u64 = 20;
+pub const NET_CONFIG_SIZE: usize = 16;
+/// Physical kernel text used only by privilege/DMA regression probes.
+/// Keep in sync with the fixed load address in linker.ld.
+pub const KERNEL_PROBE_ADDRESS: u64 = 0x0100_0000;
 pub const MAX_FRAME_SIZE: usize = 1514;
 pub const DRIVER_MMIO: u64 = 0x5000_0000;
 pub const DRIVER_DMA: u64 = 0x5020_0000;
 pub const DRIVER_IOVA: u64 = 0x1000_0000;
+pub const DRIVER_IOVA_STRIDE: u64 = 0x20_0000;
+pub const MAX_NIC_INTERFACES: usize = 8;
 pub const EIO: i64 = -5;
 pub const ETIMEDOUT: i64 = -110;
 

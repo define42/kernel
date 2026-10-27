@@ -57,7 +57,7 @@ pub fn run(
                             assert_ne!(context.error_code & 2, 0, "write fault bit");
                         }
                         match mode {
-                            3 | 4 => assert_eq!(context.cr2, 0x100000),
+                            3 | 4 => assert_eq!(context.cr2, crate::abi::KERNEL_PROBE_ADDRESS),
                             5 => assert_eq!(context.cr2, 0xfed00000),
                             _ => assert!(context.cr2 >= crate::userspace::USER_BASE),
                         }

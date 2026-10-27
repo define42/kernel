@@ -2,7 +2,7 @@
 
 use core::arch::asm;
 
-use crate::abi;
+use crate::{abi, network_config::NetworkConfig};
 
 /// Issue a raw syscall for ABI probes.
 ///
@@ -36,6 +36,40 @@ pub fn poll() {
 
 pub fn now_millis() -> i64 {
     call(abi::SYS_NOW, 0, 0, 0)
+}
+
+pub fn network_config() -> Result<NetworkConfig, i64> {
+    let mut bytes = [0_u8; abi::NET_CONFIG_SIZE];
+    let result = call(
+        abi::SYS_NET_CONFIG,
+        bytes.as_mut_ptr() as u64,
+        bytes.len() as u64,
+        0,
+    );
+    if result == 0 {
+        NetworkConfig::from_wire(bytes).map_err(|_| abi::EINVAL)
+    } else if result < 0 {
+        Err(result)
+    } else {
+        Err(abi::EINVAL)
+    }
+}
+
+pub fn random_seed() -> Result<u64, i64> {
+    let mut bytes = [0_u8; 8];
+    let result = call(
+        abi::SYS_RANDOM,
+        bytes.as_mut_ptr() as u64,
+        bytes.len() as u64,
+        0,
+    );
+    if result == 0 {
+        Ok(u64::from_le_bytes(bytes))
+    } else if result < 0 {
+        Err(result)
+    } else {
+        Err(abi::EINVAL)
+    }
 }
 
 pub fn mac() -> Result<[u8; 6], i64> {

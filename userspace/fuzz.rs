@@ -62,7 +62,14 @@ pub fn run(seed: u64, iterations: u64) -> ! {
             18 => (abi::SYS_LISTEN, fd, 80, 0, i64::MAX),
             19 => (abi::SYS_RECV, fd, address, length, i64::MAX),
             20 => (abi::SYS_SEND, fd, address, length, i64::MAX),
-            22 => (abi::SYS_FRAME_RECV + random % 9, 0, 0, 0, abi::EACCES),
+            22 => (
+                abi::SYS_FRAME_RECV
+                    + ((random >> 24) % (abi::SYS_NET_CONFIG - abi::SYS_FRAME_RECV + 1)),
+                address,
+                abi::NET_CONFIG_SIZE as u64,
+                0,
+                abi::EACCES,
+            ),
             _ => (abi::SYS_NOW, 0, 0, 0, i64::MAX),
         };
         // SAFETY: invalid pointers are supplied only where the ABI must reject

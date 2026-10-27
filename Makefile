@@ -8,12 +8,20 @@ QEMU ?= qemu-system-x86_64
 PYTHON ?= python3
 HOST_PORT ?= 5555
 HTTP_PORT ?= 8080
+HTTP_PORT_1 ?= 8081
+HOST_PORT_1 ?= 5556
+SERIAL_PORT ?= 4444
 FUZZ_SECONDS ?= 30
 FUZZ_SEED ?= 1
 FUZZ_ITERATIONS ?= 100000
 FUZZ_TIMEOUT ?= 120
 HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 QEMU_NET ?= -device e1000,netdev=net0 -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$(HOST_PORT)-10.0.2.15:1234,hostfwd=tcp:127.0.0.1:$(HTTP_PORT)-10.0.2.15:80
+QEMU_MULTI_NET ?= -device e1000,netdev=net0,bus=pcie.0,addr=0x02,mac=52:54:00:12:34:56 -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$(HOST_PORT)-10.0.2.15:1234,hostfwd=tcp:127.0.0.1:$(HTTP_PORT)-10.0.2.15:80 -device e1000,netdev=net1,bus=pcie.0,addr=0x03,mac=52:54:00:12:34:57 -netdev user,id=net1,hostfwd=tcp:127.0.0.1:$(HOST_PORT_1)-10.0.2.15:1234,hostfwd=tcp:127.0.0.1:$(HTTP_PORT_1)-10.0.2.15:80
+GRUB_MKRESCUE ?= grub-mkrescue
+GRUB_FILE ?= grub-file
+OVMF_CODE ?= /usr/share/OVMF/OVMF_CODE_4M.fd
+OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS_4M.fd
 QEMU_FLAGS ?=
 
 TARGET := x86_64-unknown-none
@@ -55,7 +63,7 @@ debug: kernel
 	$(QEMU) $(QEMU_COMMON) $(QEMU_NET) -kernel $(KERNEL_BIN) -display none -serial mon:stdio -S -gdb tcp:127.0.0.1:1234 $(QEMU_FLAGS)
 
 # Isolate the test feature's artifacts from the normal boot image.
-test: test-boot test-userspace test-preemption test-host test-abuse test-net test-packets test-http test-services
+test: test-boot test-userspace test-preemption test-host test-abuse test-net test-packets test-http test-services test-serial test-setup test-multi-nic test-multi-nic-guards test-multi-nic-isolation
 
 test-boot:
 	$(CARGO) build --release --features smoke-test --target $(TARGET) --target-dir target/smoke-test
@@ -77,6 +85,21 @@ test-preemption:
 	$(PYTHON) scripts/preemption_test.py "$(QEMU)" build/preemption-test/kernel.bin
 
 test-host:
+	@mkdir -p target/host-tests
+	rustc --edition 2024 --test userspace/network_config.rs -o target/host-tests/network-config
+	target/host-tests/network-config
+	rustc --edition 2024 --test src/shell_input.rs -D warnings -o target/host-tests/shell-input
+	target/host-tests/shell-input
+	rustc --edition 2024 --test tests/serial_shell.rs -D warnings -o target/host-tests/serial-shell
+	target/host-tests/serial-shell --skip shell_input::tests
+	rustc --edition 2024 --test tests/setup_plan.rs -D warnings -o target/host-tests/setup-plan
+	target/host-tests/setup-plan setup_plan::tests
+	rustc --edition 2024 --test src/pci.rs -D warnings -o target/host-tests/pci
+	target/host-tests/pci
+	rustc --edition 2024 --test src/platform.rs -o target/host-tests/platform
+	target/host-tests/platform
+	rustc --edition 2024 --test tests/clock.rs -D warnings -o target/host-tests/clock
+	target/host-tests/clock time::tests
 	$(CARGO) test --manifest-path tests/host/Cargo.toml --target $(HOST_TARGET) --target-dir target/host-tests
 
 test-abuse: kernel
@@ -110,6 +133,8 @@ check:
 	rustfmt --edition 2024 --check userspace/main.rs userspace/netd.rs userspace/driver.rs
 	$(CARGO) clippy --target $(TARGET) -- -D warnings
 	$(CARGO) clippy --features userspace-test --target $(TARGET) -- -D warnings
+	$(CARGO) clippy --features baremetal --target $(TARGET) -- -D warnings
+	$(CARGO) clippy --features userspace-test,baremetal --target $(TARGET) -- -D warnings
 	$(CARGO) clippy --features preemption-test --target $(TARGET) -- -D warnings
 	$(CARGO) clippy --features isolation-test --target $(TARGET) -- -D warnings
 	$(CARGO) clippy --features fuzz-test --target $(TARGET) -- -D warnings
@@ -132,7 +157,19 @@ help:
 	  'make setup     Install the Rust bare-metal target' \
 	  'make run       Boot QEMU in this terminal (Ctrl-a x to exit)' \
 	  'make run-gui   Boot QEMU with a VGA window and serial console' \
+	  'make run-serial  Boot with COM1 on localhost:4444 (SERIAL_PORT overrides)' \
+	  'make console   Attach to the serial socket; Ctrl-] detaches' \
+	  'make test-serial  Test shell, live NIC changes, reconnects, and HTTP' \
+	  'make test-setup  Test serial JSON setup, batch validation, and live NICs' \
+	  'make run-multi-nic  Boot two independently active NICs' \
+	  'make run-multi-nic-serial  Two NICs plus the reconnectable serial socket' \
+	  'make test-multi-nic  Test simultaneous traffic and independent NIC configuration' \
+	  'make test-multi-nic-guards  Test eight active NICs, inventory guards, and PCI DMA state' \
+	  'make test-multi-nic-isolation  Test cross-NIC faults with peer traffic active' \
+	  'make test-multi-nic-shared-failure  Test quarantine after a shared IOMMU failure' \
 	  'make debug     Wait for GDB on localhost:1234 before booting' \
+	  'make iso       Create build/kernel.iso using installed GRUB platforms' \
+	  'make test-firmware  Verify GRUB/UEFI handoff in OVMF' \
 	  'make test      Run boot, ring-3 isolation, TCP, ARP/ICMP, and HTTP checks in QEMU' \
 	  'make test-net  Test TCP echo, ring wrap, reconnects, and close/reset' \
 	  'make test-packets  Test ARP, IPv4/ICMP, and checksum rejection' \
@@ -153,3 +190,100 @@ test-services:
 	@mkdir -p build/isolation-test
 	$(OBJCOPY) -O binary target/isolation-test/$(TARGET)/release/kernel build/isolation-test/kernel.bin
 	$(PYTHON) scripts/isolation_test.py "$(QEMU)" build/isolation-test/kernel.bin
+
+# GRUB uses Multiboot2 for firmware discovery; its installed platform modules
+# determine whether the image supports BIOS, UEFI, or both.
+.PHONY: iso test-firmware
+iso: kernel
+	$(PYTHON) scripts/make_iso.py $(KERNEL_BIN) build/kernel.iso --grub-mkrescue "$(GRUB_MKRESCUE)" --grub-file "$(GRUB_FILE)"
+
+test-firmware: test-boot
+	$(PYTHON) scripts/make_iso.py $(TEST_BIN) build/test/kernel.iso --grub-mkrescue "$(GRUB_MKRESCUE)" --grub-file "$(GRUB_FILE)"
+	$(PYTHON) scripts/firmware_test.py "$(QEMU)" build/test/kernel.iso --code "$(OVMF_CODE)" --vars "$(OVMF_VARS)"
+
+$(foreach setting,KERNEL_IPV4 KERNEL_PREFIX KERNEL_GATEWAY KERNEL_ECHO,$(if $(filter undefined,$(origin $(setting))),,$(eval export $(setting))))
+
+# Separate output prevents an experimental hardware build from replacing the
+# known QEMU development image. Require deliberate address and echo settings.
+.PHONY: baremetal baremetal-iso
+baremetal:
+	@test -n "$(KERNEL_IPV4)" -a -n "$(KERNEL_PREFIX)" -a -n "$(KERNEL_GATEWAY)" -a "$(KERNEL_ECHO)" = 0 || { echo 'Set KERNEL_IPV4, KERNEL_PREFIX, KERNEL_GATEWAY (or none), and KERNEL_ECHO=0'; exit 1; }
+	$(CARGO) build --locked --release --features baremetal --target $(TARGET) --target-dir target/baremetal
+	@mkdir -p build/baremetal
+	$(OBJCOPY) -O binary target/baremetal/$(TARGET)/release/kernel build/baremetal/kernel.bin
+	cp target/baremetal/$(TARGET)/release/webserver.elf target/baremetal/$(TARGET)/release/netd.elf target/baremetal/$(TARGET)/release/nic-driver.elf build/baremetal/
+
+baremetal-iso: baremetal
+	$(PYTHON) scripts/make_iso.py build/baremetal/kernel.bin build/baremetal/kernel.iso --grub-mkrescue "$(GRUB_MKRESCUE)" --grub-file "$(GRUB_FILE)"
+
+.PHONY: test-deployment test-apic audit
+test-deployment:
+	KERNEL_IPV4=10.77.0.15 KERNEL_PREFIX=24 KERNEL_GATEWAY=10.77.0.2 KERNEL_ECHO=0 $(CARGO) build --locked --release --target $(TARGET) --target-dir target/deployment-test
+	@mkdir -p build/deployment-test
+	$(OBJCOPY) -O binary target/deployment-test/$(TARGET)/release/kernel build/deployment-test/kernel.bin
+	$(PYTHON) scripts/deployment_test.py "$(QEMU)" build/deployment-test/kernel.bin
+
+test-apic:
+	$(CARGO) build --locked --release --features userspace-test,baremetal --target $(TARGET) --target-dir target/apic-test
+	@mkdir -p build/apic-test
+	$(OBJCOPY) -O binary target/apic-test/$(TARGET)/release/kernel build/apic-test/kernel.bin
+	$(PYTHON) scripts/userspace_test.py "$(QEMU)" build/apic-test/kernel.bin --cpu max
+
+# Install cargo-audit separately; this target never suppresses advisories.
+audit:
+	$(CARGO) audit --file Cargo.lock
+	$(CARGO) audit --file userspace/services/Cargo.lock
+	$(CARGO) audit --file tests/host/Cargo.lock
+
+.PHONY: test-interrupt-remapping
+test-interrupt-remapping:
+	KERNEL_IR_PROBE=1 $(CARGO) build --locked --release --features isolation-test --target $(TARGET) --target-dir target/interrupt-remap-test
+	@mkdir -p build/interrupt-remap-test
+	$(OBJCOPY) -O binary target/interrupt-remap-test/$(TARGET)/release/kernel build/interrupt-remap-test/kernel.bin
+	$(PYTHON) scripts/interrupt_remapping_test.py "$(QEMU)" build/interrupt-remap-test/kernel.bin
+
+.PHONY: test-hardware-refusal
+test-hardware-refusal:
+	$(MAKE) baremetal-iso KERNEL_IPV4=192.168.50.10 KERNEL_PREFIX=24 KERNEL_GATEWAY=192.168.50.1 KERNEL_ECHO=0
+	$(PYTHON) scripts/firmware_test.py "$(QEMU)" build/baremetal/kernel.iso --hardware-refusal --code "$(OVMF_CODE)" --vars "$(OVMF_VARS)"
+
+# Raw COM1 transport, bound to loopback; the kernel owns every input byte.
+.PHONY: run-serial console test-serial test-setup
+run-serial: kernel
+	$(QEMU) $(QEMU_COMMON) $(QEMU_NET) -kernel $(KERNEL_BIN) -display none -monitor none -chardev socket,id=com1,host=127.0.0.1,port=$(SERIAL_PORT),server=on,wait=off -serial chardev:com1 $(QEMU_FLAGS)
+
+console:
+	$(PYTHON) scripts/serial_client.py --port $(SERIAL_PORT)
+
+test-serial: kernel
+	$(PYTHON) scripts/serial_test.py "$(QEMU)" $(KERNEL_BIN)
+
+test-setup: kernel
+	$(PYTHON) scripts/setup_test.py "$(QEMU)" $(KERNEL_BIN)
+
+# Separate user networks exercise independent active NICs; all forwards are local.
+.PHONY: run-multi-nic run-multi-nic-serial test-multi-nic test-multi-nic-guards
+run-multi-nic: kernel
+	$(QEMU) $(QEMU_COMMON) $(QEMU_MULTI_NET) -kernel $(KERNEL_BIN) -display none -serial mon:stdio $(QEMU_FLAGS)
+
+run-multi-nic-serial: kernel
+	$(QEMU) $(QEMU_COMMON) $(QEMU_MULTI_NET) -kernel $(KERNEL_BIN) -display none -monitor none -chardev socket,id=com1,host=127.0.0.1,port=$(SERIAL_PORT),server=on,wait=off -serial chardev:com1 $(QEMU_FLAGS)
+
+test-multi-nic: kernel
+	$(PYTHON) scripts/multi_nic_test.py "$(QEMU)" $(KERNEL_BIN)
+
+test-multi-nic-guards: kernel
+	$(PYTHON) scripts/multi_nic_guard_test.py "$(QEMU)" $(KERNEL_BIN)
+
+.PHONY: test-multi-nic-isolation test-multi-nic-shared-failure
+test-multi-nic-isolation:
+	$(CARGO) build --release --features isolation-test --target $(TARGET) --target-dir target/isolation-test
+	@mkdir -p build/isolation-test
+	$(OBJCOPY) -O binary target/isolation-test/$(TARGET)/release/kernel build/isolation-test/kernel.bin
+	$(PYTHON) scripts/multi_nic_isolation_test.py "$(QEMU)" build/isolation-test/kernel.bin
+
+test-multi-nic-shared-failure:
+	KERNEL_SHARED_FAULT_PROBE=1 $(CARGO) build --release --features isolation-test --target $(TARGET) --target-dir target/shared-failure-test
+	@mkdir -p build/shared-failure-test
+	$(OBJCOPY) -O binary target/shared-failure-test/$(TARGET)/release/kernel build/shared-failure-test/kernel.bin
+	$(PYTHON) scripts/multi_nic_isolation_test.py "$(QEMU)" build/shared-failure-test/kernel.bin --shared-failure

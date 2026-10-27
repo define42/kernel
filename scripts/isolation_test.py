@@ -24,6 +24,7 @@ EXPECTED = (
     b"Network IPC validation checks passed.",
     b"Pending RPC reply validation checks passed.",
     b"Process address-space and SIMD isolation checks passed.",
+    b"Revoked driver MMIO/DMA mappings fault at CPL3.",
     b"Service web stopped:",
     b"Service network stopped:",
     b"Service driver stopped:",
@@ -83,6 +84,11 @@ def check_recovery(args: argparse.Namespace, directory: Path, deadline: float) -
             output = check_guest(process, serial)
             if COMPLETE in output:
                 missing = [marker.decode() for marker in EXPECTED if marker not in output]
+                if args.interrupt_remapping:
+                    for marker in (b"Nonpresent interrupt-remapping entry blocked NIC MSI.",
+                                   b"QEMU compatibility-format interrupts remain unverified."):
+                        if marker not in output:
+                            missing.append(marker.decode())
                 if missing:
                     raise RuntimeError(f"completion without required checks: {missing}")
             if recovered < 3:
@@ -149,6 +155,8 @@ def main() -> int:
                         help="QEMU CPU model with APIC disabled (default: max,-apic)")
     parser.add_argument("--timeout", type=positive_timeout, default=30.0,
                         help="total deadline for all three boots in seconds (default: 30)")
+    parser.add_argument("--interrupt-remapping", action="store_true",
+                        help="exercise VT-d IR initialization and nonpresent-entry rejection")
     args = parser.parse_args()
     deadline = time.monotonic() + args.timeout
     with tempfile.TemporaryDirectory(prefix="kernel-service-isolation-") as name:
