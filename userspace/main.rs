@@ -121,6 +121,18 @@ fn run_probe(mode: u64) -> ! {
                 options(noreturn),
             ),
             13 => asm!("2:", "pause", "jmp 2b", options(noreturn)),
+            16 => {
+                for number in abi::SYS_FRAME_RECV..=abi::SYS_MAC_REGISTER {
+                    assert_eq!(syscall::raw(number, 0, 0, 0), abi::EACCES);
+                }
+                for address in [abi::DRIVER_MMIO, abi::DRIVER_DMA, 0x100000, u64::MAX] {
+                    assert_eq!(syscall::raw(abi::SYS_SEND, 0, address, 1), abi::EFAULT);
+                    assert_eq!(syscall::raw(abi::SYS_RECV, 0, address, 1), abi::EFAULT);
+                }
+                assert_eq!(syscall::raw(abi::SYS_LISTEN, 0, 81, 0), abi::EACCES);
+                syscall::log("IPC capability checks passed.\n");
+                asm!("ud2", options(noreturn));
+            }
             14 => loop {
                 syscall::raw(abi::SYS_NOW, 0, 0, 0);
             },

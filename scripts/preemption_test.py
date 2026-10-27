@@ -22,7 +22,7 @@ def main():
             spin = flood = 0
             while True:
                 output = serial.read_bytes()
-                if any(marker in output for marker in (b"KERNEL PANIC", b"Userspace fault:", b"Web process stopped")):
+                if any(marker in output for marker in (b"KERNEL PANIC", b"Userspace fault:", b"Web process stopped", b"Service restart scheduled", b"Networking quarantined")):
                     raise RuntimeError("guest failure during preemption test")
                 in_flood = b"Preemption test: syscall loop" in output
                 with connect(port, deadline) as client:

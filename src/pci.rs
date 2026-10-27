@@ -16,6 +16,27 @@ pub struct Function {
 }
 
 impl Function {
+    #[cfg(not(feature = "userspace-test"))]
+    pub fn bus(self) -> u8 {
+        self.bus
+    }
+
+    #[cfg(not(feature = "userspace-test"))]
+    pub fn devfn(self) -> u8 {
+        (self.device << 3) | self.function
+    }
+
+    #[cfg(not(feature = "userspace-test"))]
+    pub fn disable_bus_master(self) {
+        let command = self.read_u32(0x04) as u16;
+        self.write_command((command | COMMAND_INTERRUPT_DISABLE) & !COMMAND_BUS_MASTER);
+    }
+
+    #[cfg(not(feature = "userspace-test"))]
+    pub fn bus_master_enabled(self) -> bool {
+        self.read_u32(0x04) & u32::from(COMMAND_BUS_MASTER) != 0
+    }
+
     fn config_address(self, offset: u8) -> u32 {
         (1 << 31)
             | (u32::from(self.bus) << 16)

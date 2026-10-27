@@ -13,6 +13,13 @@ fn main() {
         "userspace/syscall.rs",
         "userspace/http.rs",
         "userspace/linker.ld",
+        "userspace/netd.rs",
+        "userspace/net_syscall.rs",
+        "userspace/driver.rs",
+        "userspace/e1000.rs",
+        "userspace/services/Cargo.toml",
+        "userspace/services/Cargo.lock",
+        "src/abuse.rs",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
@@ -62,6 +69,7 @@ fn main() {
     if [
         "CARGO_FEATURE_USERSPACE_TEST",
         "CARGO_FEATURE_PREEMPTION_TEST",
+        "CARGO_FEATURE_ISOLATION_TEST",
         "CARGO_FEATURE_FUZZ_TEST",
     ]
     .iter()
@@ -81,4 +89,75 @@ fn main() {
     let profile = output.ancestors().nth(3).expect("Cargo profile directory");
     std::fs::copy(output.join("webserver.elf"), profile.join("webserver.elf"))
         .expect("copy userspace ELF beside kernel");
+    if env::var_os("CARGO_FEATURE_USERSPACE_TEST").is_some() {
+        return;
+    }
+    let status = Command::new(env::var_os("RUSTC").unwrap())
+        .arg(root.join("userspace/driver.rs"))
+        .args([
+            "--edition=2024",
+            "--crate-name=nic_driver",
+            "--check-cfg=cfg(driver_test)",
+            "--crate-type=bin",
+            "--target=x86_64-unknown-none",
+            "-Cpanic=abort",
+            "-Copt-level=2",
+            "-Cdebuginfo=2",
+            "-Crelocation-model=static",
+            "-Ccode-model=small",
+            "-Clink-arg=--build-id=none",
+            "-Dwarnings",
+        ])
+        .arg(format!(
+            "-Clink-arg=-T{}",
+            root.join("userspace/linker.ld").display()
+        ))
+        .args(
+            env::var_os("CARGO_FEATURE_ISOLATION_TEST")
+                .is_some()
+                .then_some("--cfg=driver_test"),
+        )
+        .arg("-o")
+        .arg(output.join("nic-driver.elf"))
+        .status()
+        .expect("run driver Rust compiler");
+    assert!(status.success(), "userspace driver failed to build");
+    let flags = [
+        "-Crelocation-model=static".to_owned(),
+        "-Ccode-model=small".to_owned(),
+        "-Clink-arg=--build-id=none".to_owned(),
+        format!(
+            "-Clink-arg=-T{}",
+            root.join("userspace/linker.ld").display()
+        ),
+    ];
+    let service_target = output.join("services-target");
+    let status = Command::new(env::var_os("CARGO").unwrap())
+        .args([
+            "build",
+            "--locked",
+            "--release",
+            "--target",
+            "x86_64-unknown-none",
+            "--manifest-path",
+        ])
+        .arg(root.join("userspace/services/Cargo.toml"))
+        .arg("--target-dir")
+        .arg(&service_target)
+        .env("CARGO_ENCODED_RUSTFLAGS", flags.join("\x1f"))
+        .status()
+        .expect("build userspace networking service");
+    assert!(
+        status.success(),
+        "userspace network service failed to build"
+    );
+    std::fs::copy(
+        service_target.join("x86_64-unknown-none/release/netd"),
+        output.join("netd.elf"),
+    )
+    .expect("copy network service ELF");
+    for name in ["nic-driver.elf", "netd.elf"] {
+        std::fs::copy(output.join(name), profile.join(name))
+            .expect("copy service ELF beside kernel");
+    }
 }

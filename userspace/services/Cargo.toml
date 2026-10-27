@@ -1,0 +1,21 @@
+[package]
+name = "network-service"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "auto-icmp-echo-reply", "socket-tcp"] }
+
+[[bin]]
+name = "netd"
+path = "../netd.rs"
+test = false
+bench = false
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+debug = true

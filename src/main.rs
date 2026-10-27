@@ -4,29 +4,33 @@
 #[cfg(not(feature = "smoke-test"))]
 #[path = "../abi.rs"]
 mod abi;
-#[cfg(not(feature = "smoke-test"))]
+#[cfg(all(not(feature = "smoke-test"), feature = "userspace-test"))]
 mod abuse;
 #[cfg(not(feature = "smoke-test"))]
 mod arch;
 mod console;
-#[cfg(not(feature = "smoke-test"))]
+#[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+mod device;
+#[cfg(all(not(feature = "smoke-test"), feature = "userspace-test"))]
 mod e1000;
+#[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
+mod iommu;
 #[cfg(not(feature = "smoke-test"))]
 mod memory;
-#[cfg(not(feature = "smoke-test"))]
+#[cfg(all(not(feature = "smoke-test"), feature = "userspace-test"))]
+#[path = "legacy_net.rs"]
+mod net;
+#[cfg(not(any(feature = "smoke-test", feature = "userspace-test")))]
 mod net;
 #[cfg(not(feature = "smoke-test"))]
 mod pci;
-#[cfg(not(feature = "smoke-test"))]
+#[cfg(all(not(feature = "smoke-test"), feature = "userspace-test"))]
 mod syscall;
 #[cfg(not(feature = "smoke-test"))]
 mod time;
 #[cfg(not(feature = "smoke-test"))]
 mod timer;
-#[cfg(all(
-    any(feature = "userspace-test", feature = "fuzz-test"),
-    not(feature = "smoke-test")
-))]
+#[cfg(all(feature = "userspace-test", not(feature = "smoke-test")))]
 mod user_test;
 #[cfg(not(feature = "smoke-test"))]
 mod userspace;

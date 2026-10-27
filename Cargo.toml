@@ -5,13 +5,14 @@ edition = "2024"
 publish = false
 
 [dependencies]
-smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "auto-icmp-echo-reply", "socket-tcp"] }
+smoltcp = { optional = true, version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "auto-icmp-echo-reply", "socket-tcp"] }
 
 [features]
 smoke-test = []
-userspace-test = []
+userspace-test = ["dep:smoltcp"]
 preemption-test = []
 fuzz-test = []
+isolation-test = []
 
 [[bin]]
 name = "kernel"

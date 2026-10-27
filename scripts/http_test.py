@@ -31,7 +31,7 @@ def launch_qemu(args: argparse.Namespace, serial_path: Path,
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
         command = [
-            args.qemu, "-machine", "pc", "-accel", "tcg", "-m", "128M",
+            args.qemu, "-machine", "q35", "-device", "intel-iommu,intremap=off", "-accel", "tcg", "-cpu", "max,-apic", "-m", "128M",
             "-smp", "1", "-kernel", str(args.kernel), "-display", "none",
             "-serial", "stdio", "-monitor", "none", "-no-reboot", "-no-shutdown",
             "-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{port}-10.0.2.15:80",

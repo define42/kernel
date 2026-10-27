@@ -197,7 +197,7 @@ def main() -> int:
                 listener.listen(1)
                 port = listener.getsockname()[1]
                 command = [
-                    args.qemu, "-machine", "pc", "-accel", "tcg", "-m", "128M",
+                    args.qemu, "-machine", "q35", "-device", "intel-iommu,intremap=off", "-accel", "tcg", "-cpu", "max,-apic", "-m", "128M",
                     "-smp", "1", "-kernel", str(args.kernel), "-display", "none",
                     "-serial", "stdio", "-monitor", "none", "-no-reboot", "-no-shutdown",
                     "-netdev", f"socket,id=net0,connect=127.0.0.1:{port}",

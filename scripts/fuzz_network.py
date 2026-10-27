@@ -57,7 +57,7 @@ class Lab(AbstractContextManager):
                 listener.bind(("127.0.0.1", 0))
                 listener.listen(1)
                 listener.settimeout(10)
-                command = [self.args.qemu, "-machine", "pc", "-accel", "tcg",
+                command = [self.args.qemu, "-machine", "q35", "-device", "intel-iommu,intremap=off", "-accel", "tcg", "-cpu", "max,-apic",
                            "-m", "128M", "-smp", "1", "-kernel", str(self.args.kernel),
                            "-display", "none", "-monitor", "none", "-serial", "stdio",
                            "-no-reboot", "-no-shutdown", "-netdev",
@@ -83,7 +83,8 @@ class Lab(AbstractContextManager):
         check_process(self.process)
         serial = self.serial.read_bytes()
         for marker in (b"KERNEL PANIC", b"Userspace fault:", b"Userspace panic:",
-                       b"Web process stopped"):
+                       b"Web process stopped", b"Service restart scheduled", b"Networking quarantined",
+                       b"Contained NIC DMA fault", b"heartbeat expired", b"RPC deadline expired"):
             if marker in serial:
                 raise RuntimeError(f"guest failure marker: {marker!r}")
 

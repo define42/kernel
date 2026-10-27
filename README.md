@@ -1,67 +1,63 @@
 # Rust kernel
 
-A minimal x86-64 kernel that boots in QEMU. The kernel uses stable Rust,
-`#![no_std]`, an Intel e1000 driver, and the allocation-free
-[smoltcp](https://docs.rs/smoltcp/0.14.0/smoltcp/) network stack. A small assembly
-bootstrap enters 64-bit long mode; Rust prints boot information to VGA and the
-COM1 serial port, then starts an isolated **ring-3 HTTP process**. The e1000
-driver, TCP/IP stack, and TCP echo service run in ring 0.
+A small x86-64 kernel written in stable Rust that boots directly in QEMU.
+The normal build runs **three separate ring-3 services**: an HTTP server,
+an allocation-free [smoltcp](https://docs.rs/smoltcp/0.14.0/smoltcp/) network
+service, and an Intel e1000 driver. The kernel provides address spaces,
+preemption, checked IPC, and a narrow VT-d device-assignment boundary.
+Ethernet packet handling, TCP/IP, and HTTP run outside ring 0.
+
+This is a fixed QEMU experiment, targeting **q35, one CPU, an e1000 on PCI root
+bus 0, and QEMU's Intel IOMMU**. It is not a general hardware driver framework,
+a guarantee about physical-device isolation, or a claim about VM host security.
 
 ## Quick start
 
-Install Rust with [rustup](https://rustup.rs/), plus QEMU, GNU binutils, and Make.
-On Debian/Ubuntu:
+Install Rust with [rustup](https://rustup.rs/), QEMU, GNU binutils, Make, and
+Python 3.10+. On Debian/Ubuntu:
 
 ```sh
 sudo apt-get update
 sudo apt-get install make binutils qemu-system-x86 python3
-```
-
-From this directory:
-
-```sh
 make setup
 make run
 ```
 
-`make run` builds the kernel and boots it in QEMU with serial output in your
-terminal. Press **Ctrl-a**, release both keys, then press **x** to exit QEMU.
-The first build needs internet access to install the Rust target and download
-the locked smoltcp dependencies. Later builds use Cargo's local cache.
+The first build downloads the Rust bare-metal target and locked dependencies;
+later builds use Cargo's cache. `make run` builds the kernel and all three service
+ELFs, then boots QEMU with serial output in your terminal. Press **Ctrl-a**,
+release both keys, then press **x** to exit. `make run-gui` also opens a VGA
+window; a graphical desktop and QEMU display backend are required.
 
-Expected output includes:
+The production launch uses these required platform options:
 
 ```text
-Rust kernel
-===========
-CPU: x86-64 (long mode)
-Paging: 4 GiB identity mapped (PCI MMIO uncached)
-Memory: ...
-Kernel booted successfully.
-Kernel pages: RX text, R/NX constants, RW/NX data; SMEP=false SMAP=false
-Timer: PIT 100 Hz; preemptive user scheduling
-e1000: MAC 52-54-00-12-34-56, link up
+-machine q35 -device intel-iommu,intremap=off -cpu max,-apic -smp 1 -accel tcg
+```
+
+KVM access, TAP setup, root privileges, GRUB, and an ISO builder are unnecessary.
+The kernel refuses device assignment if the required IOMMU or CPU/platform
+conditions are missing. There is no fallback to unrestricted DMA. Keep `-apic`
+in the CPU model: this QEMU-specific configuration has no local APIC device and
+uses PIC/PIT scheduling interrupts instead. The reason is explained below.
+
+Startup messages identify the services and endpoints; their order can vary:
+
+```text
+Isolation: three address spaces; bounded IPC; NIC DMA restricted by VT-d
+Userspace network service: CPL=3
+e1000 driver: CPL=3, VT-d DMA grant active
 IPv4: 10.0.2.15/24, gateway 10.0.2.2
 TCP echo listening on 10.0.2.15:1234
-Host: connect to 127.0.0.1:5555 (make run default)
-Web: http://127.0.0.1:8080/ (make run default)
-Polling network. Use Ctrl-a x to exit QEMU.
-Userspace: isolated RX/R/RW pages, NX stack, guarded stack
 Userspace web server: CPL=3
 HTTP listening on 10.0.2.15:80
 ```
 
-Use `make run-gui` to see the VGA output in a QEMU window as well. This requires
-a graphical desktop and a QEMU display backend (on Ubuntu, install `qemu-system-gui`
-if needed). Both modes use software emulation, so KVM access is unnecessary.
-
 ## Web server
 
-Start the kernel with `make run`, then open **http://127.0.0.1:8080/** in your
-browser. QEMU forwards this localhost port to guest TCP port 80. The
-first connection after boot can take several seconds while QEMU resolves the
-guest's network address.
-From another terminal:
+Open **http://127.0.0.1:8080/** after starting `make run`. QEMU forwards the
+localhost port to guest TCP port 80. The first connection can take several
+seconds while QEMU resolves the guest's network address.
 
 ```sh
 curl http://127.0.0.1:8080/
@@ -69,180 +65,243 @@ curl http://127.0.0.1:8080/healthz
 curl -I http://127.0.0.1:8080/
 ```
 
-The HTTP parser and home page live in `build/webserver.elf`, a separate Rust
-userspace executable embedded in the boot image. `/healthz` returns `ok` followed
-by a newline. Both routes support GET and HEAD, including query strings. Unknown
-paths return 404, unsupported methods return 405, malformed requests return
-400, and headers larger than 2048 bytes return 431.
+The HTTP parser and embedded page live in `build/webserver.elf`. `/healthz`
+returns `ok` followed by a newline. Both routes support GET and HEAD; query
+strings do not change route selection. Unknown paths return 404, unsupported
+methods return 405, malformed requests return 400, and headers exceeding 2048
+bytes return 431.
 
-The server accepts HTTP/1.0 and HTTP/1.1, includes Content-Length in responses,
-and closes each connection after one response. HTTP/1.1 requires a Host header.
-It has four connection slots with fixed buffers and no heap allocation. Partial
-requests have an absolute 5-second deadline; stalled sends or closes time out
-after 10 seconds. The kernel also applies connection admission and lifetime
-limits described below. Request bodies, chunked transfer, persistent
-connections, and TLS are not supported.
+The server accepts HTTP/1.0 and HTTP/1.1, sends Content-Length, and closes each
+connection after one response. HTTP/1.1 requires one nonempty Host header.
+There are four connection slots with fixed buffers. Partial requests have an
+absolute 5-second deadline; stalled sends or closes time out after 10 seconds.
+The network service applies additional admission and lifetime limits below.
+Request bodies, chunked transfer, persistent connections, and TLS are unsupported.
 
-Use `make run HTTP_PORT=8081` to change the host port. The existing TCP echo
-service remains available on localhost port 5555 independently of HTTP.
+Use `make run HTTP_PORT=8081` to choose another host HTTP port. TCP echo is
+available separately on localhost port 5555 during normal operation; service
+restarts can reset existing connections.
 
-## Userspace and privilege boundary
+## Services and IPC
 
-The web server runs at x86 privilege level 3. It starts through `iretq` with its
-own registers and 64 KiB stack. The kernel loads its ELF segments into a 2 MiB
-virtual window at `0x40000000`, backed by separate physical RAM. Only the
-program's pages are user accessible: code is RX, constants are read-only and NX,
-data and stack are RW and NX, and a guard page below the stack is unmapped.
-Kernel memory, page tables, trap stacks, NIC DMA buffers, and MMIO stay
-supervisor-only. Kernel text is RX, constants are read-only and NX, and kernel
-data, stacks, page tables, DMA buffers, and the physical user-memory backing are
-RW and NX. The null page and guard pages below the boot, trap, and double-fault
-stacks are unmapped. NX and CR0.WP enforce these permissions even for ring-0
-code. SMEP and SMAP are enabled when the CPU supports them; `-cpu max` in QEMU
-exercises both protections. The default QEMU CPU may report them as unavailable.
+Each service has its own CR3, physical backing, ELF image, stack, and saved
+extended CPU state. Their common virtual entry address does not imply shared
+memory.
 
-A DPL-3 `int 0x80` gate transfers control onto the TSS kernel stack. The kernel
-validates each buffer's full range and page permissions, then copies bytes
-through a supervisor mapping. The server cannot directly access the NIC or
-smoltcp buffers. Its four socket handles are restricted to listening on port 80.
-The shared ABI in `abi.rs` uses RAX for the call number/result and RDI, RSI, RDX
-for arguments; failures return negative error numbers.
+```mermaid
+flowchart LR
+    W["webserver · ring 3"] <-->|"bounded socket RPC"| K["kernel · ring 0<br/>scheduler, checked copies, capabilities"]
+    N["netd · ring 3<br/>ARP, IPv4, ICMP, TCP, echo, quotas"] <-->|"RPC requests/replies and opaque frames"| K
+    D["nic-driver · ring 3<br/>e1000 rings and packet I/O"] <-->|"opaque frames"| K
+    D -->|"private MMIO grant"| NIC["QEMU e1000"]
+    NIC <-->|"VT-d restricted IOVA"| P["permanent private DMA pool"]
+```
 
-| Number | Call | Arguments / result |
+| Executable | Responsibility | Access |
 | --- | --- | --- |
-| 0 | Poll | Progress network timers, one incoming packet, and outgoing traffic |
-| 1 | Clock | Milliseconds since HPET initialization |
-| 2 | Socket state | Handle; returns state, readiness flags, and queued TX bytes |
-| 3 / 4 | Receive / send | Handle, user buffer, length; returns byte count |
-| 5 / 6 | Close / abort | Handle |
-| 7 | Listen | Handle, port (80 only) |
-| 8 | Log | User UTF-8 buffer, length (at most 512 bytes) |
-| 9 | Exit | Exit code |
+| `build/webserver.elf` | HTTP parsing and responses | Four socket handles, port 80 only |
+| `build/netd.elf` | smoltcp, TCP echo, HTTP sockets, admission control | Frame queues and socket RPC endpoint |
+| `build/nic-driver.elf` | e1000 register programming and RX/TX descriptors | Its assigned MMIO window, private DMA pool, and frame queues |
 
-There is **one user process on one CPU**, with no userspace threads. The PIT
-interrupts at 100 Hz and can preempt a user program that never calls Poll.
-Userspace runs with IF set and IOPL zero; it cannot disable interrupts. The
-kernel keeps IF clear while handling traps, system calls, and network state.
-Between network polls, the scheduler returns to network work after 64 completed
-system calls or when its 10-millisecond slice budget has elapsed, checked after
-each call. This budget also prevents a loop of short system calls from starving
-the NIC; kernel operations themselves are not preempted.
+The kernel never interprets Ethernet, IP, TCP, or HTTP packets in the normal
+build. It copies opaque frames through **two fixed queues**, one per direction,
+each holding **16 frames of at most 1514 bytes**. Full queues return `EAGAIN`.
+No service receives another service's pointers or direct access to its buffers.
 
-A user fault or exit stops the web process and aborts its sockets while the
-kernel continues servicing TCP echo. There is no general process launcher,
-filesystem, POSIX interface, or memory allocator. The embedded ELF is loaded
-automatically at boot; timer preemption does not add multiple processes.
+Socket RPC uses fixed `Request` and `Reply` records containing integers and at
+most 4096 payload bytes. One web request can be outstanding. The kernel checks
+full user buffer ranges and read/write permissions before copying data or
+changing queue state. It issues monotonically increasing request-generation
+IDs, validates reply IDs and lengths, and rejects stale replies. An unanswered
+RPC has a **2-second deadline**, after which the affected services restart.
 
-`make test-userspace` checks real ring-0 write-protection and NX faults, then
-runs thirteen ring-3 probes: actual CPL, invalid syscalls and buffers, forbidden
-kernel reads/writes, MMIO and port I/O, code write protection, NX stack
-execution, stack guard, privileged instructions, direction flags, a
-noncanonical stack pointer, and preemption of a busy loop. Each fault must
-return safely to the kernel before the next probe starts. The test runs with
-the default QEMU CPU and `-cpu max`, requiring its success message and debug-exit
-33. `make test-preemption` separately checks TCP echo progress during a pure
-user busy loop and a loop that makes system calls without yielding.
+The shared `abi.rs` uses RAX for the syscall number/result and RDI, RSI, RDX for
+arguments. A DPL-3 `int 0x80` gate enters a TSS kernel stack. Errors are negative
+error numbers. Capabilities are assigned from the calling process's identity;
+passing another handle or syscall number cannot select another service's role.
+
+| Number | Call | Allowed caller / behavior |
+| --- | --- | --- |
+| 0 | Poll | All services; yield to the scheduler and update heartbeat |
+| 1 | Clock | All services; HPET milliseconds |
+| 2 | Socket state | Web; state, readiness flags, and queued TX bytes via RPC |
+| 3 / 4 | Receive / send | Web; handle, user buffer, length; at most 4096 bytes |
+| 5 / 6 | Close / abort | Web; socket handle |
+| 7 | Listen | Web; handle and port 80 only |
+| 8 | Log | All services; UTF-8, at most 512 bytes per call and 4096 bytes/s per service |
+| 9 | Exit | All services; stop the caller and trigger supervised recovery |
+| 10 / 11 | Frame receive / send | Network service; copy from RX / into TX queue |
+| 12 / 13 | Network request / reply | Network service; receive socket RPC / submit its reply |
+| 14 / 15 | Driver RX / TX | NIC driver; copy into RX queue / from TX queue |
+| 16 | Driver ready | NIC driver; request kernel-controlled bus-master enable |
+| 17 | MAC | Network service; read the driver-registered packed MAC |
+| 18 | Register MAC | NIC driver; publish a validated unicast MAC |
+
+## CPU, memory, and scheduling
+
+Each ELF occupies a private 2 MiB virtual window beginning at `0x40000000`,
+with a 64 KiB stack. Code is RX, constants are R/NX, and data and stacks are
+RW/NX. A guard page below each user stack is unmapped. Kernel memory, page
+tables, trap stacks, and the other processes' physical backing remain
+supervisor-only. Only the driver receives the extra MMIO and DMA mappings.
+
+Kernel text is RX, constants are R/NX, and writable kernel storage is RW/NX.
+The null page and guards below boot, trap, and double-fault stacks are unmapped.
+NX and CR0.WP enforce page permissions; SMEP and SMAP are enabled when available.
+The broad supervisor identity mapping remains an explicit limitation.
+
+Process switches save and restore **FXSAVE64 state**: x87/MMX, MXCSR, and
+XMM0–XMM15. Restarts clear that state as well as program memory. FXSR, SSE, and
+SSE2 support are required. OSXSAVE remains disabled: AVX/XSAVE instructions are
+not supported, even if the emulated CPU advertises wider vector capabilities.
+
+The system has exactly three embedded services on **one CPU**, without user
+threads or a general process-launching API. A 100 Hz PIT can preempt a process
+that never yields. Userspace runs with IF set and IOPL zero. The kernel handles
+traps and IPC with IF clear and bounds a service's syscall run to **64 calls or
+10 milliseconds**, checked between calls. Kernel operations are not themselves
+preempted. Driver and network services must yield at least every **2 seconds**;
+a missed heartbeat triggers recovery.
+
+| Failure | Recovery |
+| --- | --- |
+| Web or network process fault/exit; network RPC timeout | Restart network and web, clear pending RPC and frame queues |
+| Driver fault/exit, heartbeat expiry, or detected DMA violation | Disable bus mastering, reset/quiesce NIC, revoke DMA mappings, then restart all services |
+| Device teardown or reassignment cannot be completed safely | Quarantine networking; do not resume device access |
+
+Restart delays back off from **100 ms to 6400 ms** for repeated failures.
+Connection state is discarded during dependent-service restarts, so clients
+must reconnect. Timer preemption, deadlines, queues, and restart supervision
+bound resource use; they do not guarantee service availability against a
+malicious process or network peer.
+
+## NIC and DMA boundary
+
+The supported NIC is QEMU's **e1000 / Intel 82540EM** (`8086:100e`) directly on
+**PCI root bus 0**. `e1000e`, devices behind bridges, arbitrary requester aliases,
+and general PCI passthrough are outside this implementation.
+
+The driver maps a 128 KiB MMIO window at `0x50000000` and a permanently allocated
+**260 KiB (`0x41000`) DMA pool** at `0x50200000`. VT-d maps only that pool into the
+NIC's domain, starting at **IOVA `0x10000000`**. Other requesters and other IOVAs
+are denied; there is no DMA identity or pass-through domain. The pool contains
+no kernel objects, stays pinned through resets, and is never reused as another
+process's memory. The driver uses 64 RX and 64 TX descriptors with fixed buffers.
+
+The kernel owns PCI assignment, VT-d tables, DMA grants/revocation, bus-master
+enable/disable, and reset sequencing. Ring-3 code owns normal e1000 operation.
+Device teardown stops bus mastering and resets/drains the device before
+revoking translations; failure leaves networking quarantined. Limited ACPI DMAR
+discovery supports this specific q35 setup, not arbitrary firmware platforms.
+
+DMA translation alone does **not** isolate QEMU's interrupt-message aperture.
+A malicious descriptor can target that aperture to synthesize interrupt messages.
+This build therefore requires **no local APIC device**, using
+`-cpu max,-apic -smp 1`; merely clearing the APIC-enable bit is insufficient.
+PCI INTx is disabled, and the guest uses PIC/PIT for scheduling. This is a narrow
+QEMU-specific constraint, not a replacement for a general interrupt-remapping
+implementation. Missing VT-d, an APIC-present CPU, or unsupported device topology
+causes `Network isolation unavailable:` and refusal to start the services.
 
 ## Networking
 
-`make run` attaches a QEMU **e1000 / Intel 82540EM** NIC (`8086:100e`) and uses
-QEMU's user-mode network backend. No TAP interface or root permissions are
-needed. The guest has a static IPv4 address of **10.0.2.15/24**, gateway
-**10.0.2.2**, and a **1500-byte IP MTU**. DHCP is not used.
-
-TCP port **1234** echoes every byte it receives. QEMU forwards
-**127.0.0.1:5555** on the host to that guest port. With the kernel running,
-try this from a second terminal:
+`make run` uses QEMU's user-mode backend. The guest has static IPv4 address
+**10.0.2.15/24**, gateway **10.0.2.2**, and a **1500-byte IP MTU**. TCP port
+**1234** echoes bytes; QEMU forwards it to **127.0.0.1:5555**.
 
 ```sh
 python3 - <<'PYTHON'
 import socket
 
-with socket.create_connection(("127.0.0.1", 5555), timeout=5) as client:
+with socket.create_connection(("127.0.0.1", 5555), timeout=10) as client:
     client.sendall(b"hello from the host\n")
     client.shutdown(socket.SHUT_WR)
     print(client.makefile("rb").read().decode(), end="")
 PYTHON
 ```
 
-The reply is `hello from the host`. This port provides the binary TCP echo service.
-The service handles one client at a time, preserves bytes under backpressure,
-flushes pending echoes after a peer half-close, and accepts a new connection
-after close or reset. TCP retransmission, sequencing, checksums, and flow
-control are handled by smoltcp; socket buffers are fixed at 16 KiB each.
+Echo handles one client at a time, preserves bytes under backpressure, drains
+data after a peer half-close, and reopens after close/reset. Its RX and TX socket
+buffers are 16 KiB each. smoltcp supplies retransmission, checksums, sequencing,
+and flow control inside the network process.
 
-Use `make run HOST_PORT=5556` if port 5555 is occupied, and connect to that port
-instead. `QEMU_NET` can replace the complete NIC/backend arguments; for example,
-`make run QEMU_NET="-nic none"` boots without networking and reports the missing
-NIC. The supported model is `e1000`, not `e1000e`.
+Use `make run HOST_PORT=5556` to change the host echo port. `QEMU_NET` replaces
+the NIC/backend arguments; `make run QEMU_NET="-nic none"` reports the missing
+NIC and refuses network startup. Keep the supported platform and NIC constraints
+when overriding launch options.
 
 ARP and IPv4 ICMP echo replies are supported. QEMU user-mode networking does
-not make the guest directly reachable by host `ping 10.0.2.15`; `make test-packets`
-checks ARP and ICMP by sending Ethernet frames directly through a QEMU socket
-backend. IPv6, UDP sockets, DHCP, DNS, VLANs, jumbo frames, and IPv4 fragment
-reassembly are not enabled.
+not expose the guest to host `ping 10.0.2.15`; `make test-packets` instead injects
+Ethernet frames through a private QEMU socket backend. IPv6, UDP sockets, DHCP,
+DNS, VLANs, jumbo frames, and IPv4 fragment reassembly are disabled.
 
-The kernel applies admission limits to new HTTP connections on port 80:
+The **network service** applies these limits to new HTTP connections:
 
 | Limit | Value |
 | --- | --- |
-| Active connections from one source IPv4 address | 3 |
-| Active HTTP connections in total | 4 |
-| New SYN allowance per source | Burst of 32, refilling at 16 per second |
-| New SYN allowance across all sources | Burst of 64, refilling at 32 per second |
-| Source tracking table | 32 entries; inactive entries expire after 30 idle seconds |
-| Half-open handshake lifetime | 3 seconds |
-| Total connection lifetime | 15 seconds |
+| Active HTTP connections per source IPv4 address / total | 3 / 4 |
+| New SYN allowance per source | Burst 32; refill 16/s |
+| New SYN allowance across sources | Burst 64; refill 32/s |
+| Source table | 32 entries; expire after 30 idle seconds; no eviction of recent sources |
+| Half-open handshake / absolute connection lifetime | 3 seconds / 15 seconds |
 
-Validated SYN retransmissions for an existing connection do not consume another
-admission token. Established traffic and the TCP echo service do not spend these
-HTTP admission tokens. Invalid IPv4/TCP checksums are rejected before admission.
-The source limit leaves one slot available to another source when one address
-holds three connections. These fixed limits reduce simple slot exhaustion;
-they do not guarantee availability against distributed clients, spoofed sources,
-or link saturation. Clients sharing a source address also share its quota.
+Validated SYN retransmissions for an existing tuple spend no additional tokens.
+Existing connection traffic and echo do not spend HTTP admission tokens. Invalid
+IPv4/TCP checksums are rejected before SYN admission. Existing tuples take
+priority over free listeners so retransmission cannot create duplicate sockets.
+Clients behind one source address share its quota. These limits do not prevent
+distributed abuse, source spoofing, or link saturation. TCP sequence seeds use
+boot timing rather than cryptographic entropy.
 
-## Commands
+## Commands and tests
 
 | Command | Result |
 | --- | --- |
-| `make` or `make build` | Build `build/kernel.bin`, kernel ELF, and `build/webserver.elf` |
-| `make run` | Build and boot with a terminal serial console |
-| `make run-gui` | Build and boot with a VGA window and serial console |
-| `make test` | Run boot, isolation, preemption, admission-control, TCP, ARP/ICMP, and HTTP checks |
-| `make test-net` | Exercise TCP echo through QEMU e1000 and host forwarding |
-| `make test-packets` | Exercise ARP, ICMP, and checksum rejection with Ethernet frames |
-| `make test-boot` | Run the original CPU/memory boot checks without a NIC |
-| `make test-userspace` | Verify kernel WP/NX, user isolation, and timer preemption on two CPU models |
-| `make test-preemption` | Verify TCP progress during busy and syscall-only user loops |
-| `make test-host` | Run admission-control and TCP dispatch regression tests on the host |
-| `make test-abuse` | Check per-source quotas, half-open expiry, and recovery in QEMU |
-| `make test-http` | Exercise HTTP routes, framing, errors, concurrency, and timeouts |
-| `make fuzz` | Run local HTTP, TCP, and syscall mutation campaigns |
-| `make fuzz-http` / `make fuzz-tcp` | Mutate HTTP requests or raw TCP/IP frames in a private QEMU network |
-| `make fuzz-syscalls` | Exercise seeded syscall arguments from the real ring-3 process |
-| `make check` | Check formatting and Clippy lints |
-| `make debug` | Start QEMU paused with GDB listening on `127.0.0.1:1234` |
+| `make` / `make build` | Build `build/kernel.bin` and all three service ELFs |
+| `make run` / `make run-gui` | Build and boot with terminal / VGA output |
+| `make test` | Run boot, legacy privilege, service isolation, preemption, admission, TCP, ARP/ICMP, and HTTP targets |
+| `make test-services` | Exercise the production service/DMA/IPC boundary and recovery |
+| `make test-userspace` | Run the separate legacy kernel WP/NX and ring-3 privilege baseline |
+| `make test-preemption` | Check TCP progress during busy and syscall-only web loops |
+| `make test-host` | Host admission and retransmitted-SYN dispatch regressions |
+| `make test-abuse` | HTTP source quotas, half-open expiry, and recovery |
+| `make test-net` | Binary echo, socket/ring wrap, half-close, reconnect, and reset |
+| `make test-packets` | Raw Ethernet ARP, ICMP, and checksum rejection |
+| `make test-http` | HTTP routes, framing, errors, concurrency, and timeouts |
+| `make test-boot` | CPU/memory bootstrap checks without networking |
+| `make fuzz` | Local HTTP, TCP, and syscall mutation campaigns |
+| `make fuzz-http` / `make fuzz-tcp` | HTTP / raw TCP/IP mutations in a private QEMU network |
+| `make fuzz-syscalls` | Seeded ring-3 calls against the production IPC broker |
+| `make check` | Formatting and Clippy checks |
+| `make debug` | Boot paused; GDB on `127.0.0.1:1234` |
 | `make clean` | Remove generated files |
 
-`make test` uses Python 3.10+. TCP/packet tests have a 30-second overall timeout;
-the HTTP test has a 45-second timeout, and the preemption test has a 25-second
-deadline. Tests use temporary localhost ports and terminate their QEMU process
-on completion or failure. The TCP test verifies a 320 KiB fragmented binary
-transfer, descriptor and socket buffer wrapping, FIN/EOF, repeated connections,
-an empty stream, and
-reset recovery. The packet test checks an ARP response, 130 ICMP echo replies
-with varied payload sizes, and rejection of bad IPv4/ICMP checksums. The HTTP
-test checks GET/HEAD responses, fragmented requests, error handling, repeated
-and concurrent clients, resets, and request-timeout recovery.
+`make test-services` builds the `isolation-test` feature. Its checks cover separate
+address spaces and saved SIMD/FPU state, actual forbidden DMA reads and writes,
+QEMU interrupt-aperture NMI/INIT/SMI probes, invalid IPC buffers and capabilities,
+malformed replies against a real pending RPC, and service crashes/restarts.
+The harness probes binary echo during recovery, requires three successful
+exchanges after the completion marker, and separately boots without an IOMMU
+and with an APIC-present CPU to require refusal before any ring-3 service starts.
+These are bounded implementation tests for the stated QEMU target, not a proof
+of hardware isolation or VM host security.
 
-The separate boot test has a 15-second timeout and checks the Multiboot handoff,
-BSS zero initialization, initialized data, paging, PAE, and active long mode.
-It requires both `Boot checks passed.` and QEMU debug-exit status 33. Its
-`smoke-test` feature skips networking; its artifacts are isolated from the normal
-kernel used by the network tests.
+The `userspace-test` feature is a deliberately separate baseline using the old
+ring-0 e1000/stack path. It checks kernel WP/NX, real CPL, invalid syscalls and
+buffers, forbidden memory and I/O access, stack/code permissions, privileged
+instructions, direction flags, and invalid return stacks on `qemu64` and `max`.
+Only this feature compiles `src/legacy_net.rs`, `src/e1000.rs`, and the old socket
+syscall implementation. It is not the production service/DMA test. The
+`fuzz-test` feature uses the new production broker.
 
-For formatting/linting, install the optional Rust tools if needed:
+TCP/packet and service-isolation harnesses have 30-second deadlines, HTTP has
+45 seconds, and the preemption test has 25 seconds. Tests choose temporary
+localhost ports and stop their QEMU process on success or failure. Echo includes
+a 320 KiB fragmented binary transfer; packet checks include varied ICMP replies
+and bad checksums. The boot test has a 15-second limit and requires its success
+marker plus QEMU debug-exit status 33. Test images use separate build directories.
+
+Install optional Rust tools when needed:
 
 ```sh
 rustup component add rustfmt clippy
@@ -250,23 +309,26 @@ make check
 ```
 
 Tools can be overridden, for example `make run QEMU=/path/to/qemu-system-x86_64`.
-Append QEMU options with `QEMU_FLAGS`, for example
+Append diagnostic options with
 `make run QEMU_FLAGS="-d guest_errors -D build/qemu.log"`.
 
-For debugging, run `make debug`, then in another terminal:
+For debugging:
 
 ```sh
+make debug
+# In another terminal:
 gdb target/x86_64-unknown-none/release/kernel
 (gdb) target remote 127.0.0.1:1234
 (gdb) hbreak kernel_main
 (gdb) continue
 ```
 
-The separate user symbols are in `build/webserver.elf` (also copied alongside
-the kernel ELF). In GDB, `add-symbol-file build/webserver.elf` loads its fixed
-virtual addresses; `hbreak _start` breaks at user entry.
-
-Use a GDB build with x86-64 support (`gdb-multiarch` on non-x86 hosts).
+Service symbols are in `build/webserver.elf`, `build/netd.elf`, and
+`build/nic-driver.elf`, also copied alongside the kernel ELF. Load the symbols
+for the service being inspected, for example `add-symbol-file build/netd.elf`.
+All services link at `0x40000000`; distinguish their address spaces using CR3
+rather than assuming that a virtual address identifies one process. Use a GDB
+build with x86-64 support (`gdb-multiarch` on non-x86 hosts).
 
 ## Local fuzz campaigns
 
@@ -276,8 +338,10 @@ HTTP cases mutate requests and split them across TCP segments. TCP cases mutate
 flags, options, sequence numbers, payloads, checksums, truncation, and fragment
 fields, including cases with established connections. Periodic HTTP and binary
 echo checks look for service failures after malformed input. The syscall
-campaign runs inside ring 3, varying call numbers, handles, pointers, lengths,
-and socket operations while checking results and buffer canaries.
+campaign runs in the web process against the production IPC broker, varying call
+numbers, capabilities, handles, pointers, lengths, and socket operations while
+checking results and buffer canaries. The `fuzz-test` build uses the three-service
+scheduler; it does not enable the legacy ring-0 network stack.
 
 These are seeded, mutation-based robustness tests, not coverage-guided fuzzing.
 A successful campaign reports only the cases exercised; it is not a security
@@ -322,63 +386,47 @@ make fuzz-syscalls FUZZ_SEED=42 FUZZ_ITERATIONS=1000000 FUZZ_TIMEOUT=120
 
 ## Boot and source layout
 
-QEMU loads `build/kernel.bin` using the Multiboot v1 address header. The image
-is linked at physical address 1 MiB. The bootstrap clears BSS, creates a 256 KiB
-stack, maps the first 4 GiB with 2 MiB pages, and switches from 32-bit protected
-mode to 64-bit long mode before calling Rust. The first 1 GiB remains cached;
-1–4 GiB is initially uncached for PCI MMIO and the HPET timer. After installing
-the GDT, TSS, and IDT, the kernel splits its own mapping into 4 KiB pages with
-section-specific permissions, removes null/stack guard pages, and marks all
-remaining supervisor mappings NX. Before entering userspace, the first 2 MiB
-at virtual 1 GiB is replaced with cached, permissioned 4 KiB user pages; their
-physical backing remains supervisor-only RW/NX RAM below 1 GiB.
+QEMU loads the flat `build/kernel.bin` through its Multiboot v1 address header.
+The kernel links at physical 1 MiB. Assembly clears BSS, establishes a 256 KiB
+boot stack and initial 4 GiB identity map, then enters 64-bit mode. The first
+1 GiB is cached; the initial 1–4 GiB MMIO area is uncached. Kernel initialization
+installs descriptor tables, page permissions, stack guards, and the PIC/PIT.
+The service loader builds separate page-table roots with shared supervisor
+mappings and private user pages. The kernel loads three embedded ELF images;
+`objcopy` creates the boot image, not a disk image or ISO.
 
 | File | Purpose |
 | --- | --- |
-| `src/boot.S` | Multiboot header, page tables, stack, and long-mode transition |
-| `src/main.rs` | Rust entry point, boot information, checks, and panic handler |
-| `src/console.rs` | VGA text and polled serial output |
-| `src/pci.rs` | PCI discovery and command-register setup |
-| `src/e1000.rs` | Intel 82540EM MMIO and DMA receive/transmit rings |
-| `src/time.rs` | Polled HPET monotonic clock for TCP timers |
-| `src/timer.rs` | PIC/PIT setup and 100 Hz preemption ticks |
-| `src/memory.rs` | Kernel page permissions, stack guards, and page-table audits |
-| `src/abuse.rs` | HTTP SYN quotas, source tracking, and connection expiry |
-| `src/net.rs` | NIC/TCP polling, echo service, and preemptive userspace scheduling |
-| `src/arch.rs`, `src/traps.S` | GDT/TSS/IDT, ring transitions, IRQ handling, and fault entry |
-| `src/userspace.rs` | ELF loading, protected pages, stack, and checked buffer copies |
-| `src/syscall.rs`, `abi.rs` | Kernel socket system calls and the shared ABI |
-| `userspace/main.rs`, `userspace/syscall.rs` | Ring-3 entry, event loop, and syscall wrappers |
-| `userspace/http.rs` | Userspace HTTP parser, embedded page, and connection state |
-| `userspace/linker.ld` | Separate user ELF layout at virtual address 1 GiB |
-| `src/user_test.rs`, `scripts/userspace_test.py` | Kernel protection and ring-3 isolation tests |
-| `scripts/preemption_test.py` | Network progress while userspace does not yield |
-| `tests/host`, `scripts/abuse_test.py` | Admission-control and recovery tests |
-| `scripts/fuzz_network.py` | Seeded HTTP/TCP mutation campaigns and artifacts |
-| `userspace/fuzz.rs`, `scripts/fuzz_syscalls.py` | Ring-3 syscall campaigns and logs |
-| `linker.ld` | Physical memory layout and bootstrap symbols |
-| `.cargo/config.toml` | Bare-metal Rust target and static linking flags |
-| `scripts/smoke_test.py` | Bounded QEMU boot test |
-| `scripts/network_test.py` | End-to-end TCP integration test |
-| `scripts/packet_test.py` | Raw Ethernet ARP/ICMP integration test |
-| `scripts/http_test.py` | HTTP integration test over real QEMU TCP connections |
-| `Makefile` | Build, run, test, and debug commands |
+| `src/boot.S`, `src/main.rs` | Multiboot entry, long-mode bootstrap, checks, panic handler |
+| `src/console.rs` | VGA text and serial output |
+| `src/net.rs` | Production service scheduler, capabilities, opaque frame queues, RPC broker, recovery |
+| `src/device.rs`, `src/pci.rs` | Narrow PCI assignment, private DMA lifetime, controlled reset/bus mastering |
+| `src/iommu.rs` | QEMU VT-d discovery, translation tables, faults, grant/revoke |
+| `src/userspace.rs` | ELF loading, separate CR3 roots, checked copies, FXSAVE64 process state |
+| `src/memory.rs` | Kernel page permissions, stack guards, page-table audits |
+| `src/arch.rs`, `src/traps.S` | GDT/TSS/IDT, traps, IRQs, ring transitions |
+| `src/time.rs`, `src/timer.rs` | HPET clock and 100 Hz PIC/PIT preemption |
+| `abi.rs` | Shared capability-based syscall and pointer-free RPC records |
+| `userspace/main.rs`, `userspace/http.rs`, `userspace/syscall.rs` | Web process, HTTP parser/page, socket wrappers |
+| `userspace/netd.rs`, `userspace/net_syscall.rs` | smoltcp service, echo, HTTP sockets, frame/RPC calls |
+| `src/abuse.rs` | Allocation-free HTTP admission/expiry code reused by netd and host tests |
+| `userspace/driver.rs`, `userspace/e1000.rs` | Ring-3 driver entry, MMIO, descriptors, packet I/O |
+| `userspace/linker.ld`, `userspace/services/Cargo.toml` | Separate service ELF layout and smoltcp build |
+| `src/legacy_net.rs`, `src/e1000.rs`, `src/syscall.rs`, `src/user_test.rs` | Ring-0 networking and privilege baseline, compiled only for `userspace-test` |
+| `scripts/isolation_test.py` | Production service/DMA/IPC containment, recovery, and fail-closed boot |
+| `scripts/userspace_test.py`, `scripts/preemption_test.py` | Legacy privilege baseline / production scheduling progress |
+| `tests/host`, `scripts/abuse_test.py` | Admission and TCP dispatch/recovery regressions |
+| `scripts/network_test.py`, `scripts/packet_test.py`, `scripts/http_test.py` | TCP, raw Ethernet, and HTTP integration harnesses |
+| `scripts/fuzz_network.py`, `userspace/fuzz.rs`, `scripts/fuzz_syscalls.py` | Mutation campaigns and reproducibility logs |
+| `linker.ld`, `.cargo/config.toml`, `build.rs`, `Makefile` | Kernel layout, target flags, service embedding, build/run/test commands |
+| `scripts/smoke_test.py` | Bounded bootstrap checks |
 
-The ELF is converted to a flat Multiboot image with `objcopy`; it is not a disk
-image or ISO. QEMU's `-kernel` loader performs the bootloader handoff, so GRUB,
-an ISO builder, and a nightly Rust toolchain are unnecessary.
-
-This is a starting kernel with one preemptible user process. It has no general
-multi-process scheduler, heap allocator, filesystem, or keyboard input. The
-kernel still uses a broad supervisor identity map, now with explicit page
-permissions. The boot target is QEMU's legacy PC machine with its HPET at the
-standard fixed address. The e1000 uses 64 receive and transmit descriptors with
-static DMA buffers and software checksums. Networking is polled continuously,
-so an idle guest uses CPU time; only the PIT supplies scheduling interrupts.
-There is no ACPI discovery or UEFI boot path. The TCP sequence seed uses boot
-timing and is not a cryptographic entropy source. Four HTTP slots, fixed quotas,
-and fuzz campaigns do not make this a production-hardened network service; TLS
-and stronger denial-of-service defenses are not implemented.
+The project has no heap allocator, filesystem, keyboard input, general process
+launcher, SMP support, or UEFI boot path. Networking is polled, so an idle guest
+uses CPU time. CPU protection, the fixed DMA boundary, bounded IPC, quotas, and
+fuzz campaigns do not make it a production-hardened operating system. Static
+addressing, weak boot-time entropy, four HTTP slots, and lack of TLS remain
+intentional limitations.
 
 References: [Rust bare-metal target](https://doc.rust-lang.org/rustc/platform-support/x86_64-unknown-none.html),
 [Multiboot specification](https://www.gnu.org/software/grub/manual/multiboot/multiboot.html),

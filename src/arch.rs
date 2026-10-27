@@ -278,8 +278,9 @@ pub fn init() {
 /// Call only on the bootstrap CPU after `init`, with external interrupts
 /// disabled, and never recursively. The kernel stack, this context, GDT/TSS,
 /// IDT, and trap code/stacks must remain supervisor-only and writable/executable
-/// as appropriate. No FPU or SIMD state is switched (both binaries use the
-/// soft-float bare-metal target). Invalid user return addresses are reported as
+/// as appropriate. The caller restores this process's FPU/SIMD state before
+/// entry and saves it before restoring the kernel state. This routine switches
+/// general registers only. Invalid user return addresses are reported as
 /// synthetic faults, since a faulting IRET itself would execute at ring 0.
 pub unsafe fn resume(context: &mut Context) {
     assert!(INITIALIZED.load(Ordering::Relaxed), "GDT is not installed");

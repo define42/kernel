@@ -44,8 +44,6 @@ unsafe extern "C" {
     static __data_start: u8;
     static __kernel_end: u8;
     static boot_stack_guard: u8;
-    static mut boot_pml4: [u64; 512];
-    static mut boot_pdpt: [u64; 512];
     static mut boot_page_directory: [u64; 2048];
 }
 
@@ -177,10 +175,15 @@ pub fn permissions(address: u64) -> Option<Permissions> {
     if address >= IDENTITY_END {
         return None;
     }
-    // SAFETY: the bootstrap mapping and our private tables stay resident. The
-    // userspace loader only substitutes its own resident PT at PDE512.
+    let root = crate::userspace::active_root();
+    assert!(
+        crate::userspace::expected_pdpt(root).is_some(),
+        "unknown address-space root"
+    );
+    // SAFETY: boot/process roots and their tables remain resident. Every root
+    // shares the same protected supervisor identity mappings for these tables.
     unsafe {
-        let pml4 = read_volatile(addr_of!(boot_pml4).cast::<u64>());
+        let pml4 = read_volatile(root as *const u64);
         if pml4 & PRESENT == 0 {
             return None;
         }
@@ -216,7 +219,8 @@ pub fn permissions(address: u64) -> Option<Permissions> {
 }
 
 /// Audit actual page-table leaves, kernel section permissions, and CPU controls.
-/// This also remains valid after the userspace loader replaces PDE512.
+/// This checks the currently active kernel or process CR3, including ownership
+/// of private user pages and the driver's narrowly assigned device mappings.
 pub fn check_permissions() {
     assert!(INITIALIZED.load(Ordering::Relaxed));
     let cr0: u64;
@@ -244,47 +248,47 @@ pub fn check_permissions() {
         assert!(permissions(address).is_none(), "stack guard is mapped");
     }
 
-    // Confirm that no other root/PDPT entries create hidden mappings or aliases.
-    // SAFETY: these are the fixed bootstrap tables, checked against their known
-    // physical addresses before following the per-directory leaf entries.
+    // Confirm all intermediate tables belong to this exact address space;
+    // other roots cannot borrow a process's private pages or device mappings.
+    let root = crate::userspace::active_root();
+    let expected_pdpt = crate::userspace::expected_pdpt(root).expect("unknown address-space root");
+    audit_table(root);
+    audit_table(expected_pdpt);
+    // SAFETY: known static root/table identities are checked before following
+    // them. All referenced tables remain supervisor-only, writable, and NX.
     unsafe {
-        let pml4 = addr_of!(boot_pml4).cast::<u64>();
-        let pdpt = addr_of!(boot_pdpt).cast::<u64>();
-        let directory = addr_of!(boot_page_directory).cast::<u64>();
-        assert_eq!(read_volatile(pml4) & ADDRESS, pdpt as u64);
+        let pml4 = root as *const u64;
+        let pdpt = expected_pdpt as *const u64;
+        assert_eq!(read_volatile(pml4) & ADDRESS, expected_pdpt);
         for index in 1..512 {
             assert_eq!(read_volatile(pml4.add(index)) & PRESENT, 0);
         }
         for index in 0..512 {
             let entry = read_volatile(pdpt.add(index));
-            if index < 4 {
-                assert_ne!(entry & PRESENT, 0);
-                assert_eq!(entry & HUGE, 0);
-                assert_eq!(entry & ADDRESS, directory.add(index * 512) as u64);
-            } else {
+            if index >= 4 {
                 assert_eq!(entry & PRESENT, 0);
-            }
-        }
-        for index in 0..2048 {
-            let entry = read_volatile(directory.add(index));
-            if entry & PRESENT == 0 {
                 continue;
             }
-            let base = index as u64 * HUGE_SIZE;
-            if entry & HUGE != 0 {
-                audit_leaf(base);
-                assert_eq!(entry & ADDRESS & !(HUGE_SIZE - 1), base);
-            } else {
-                let physical = entry & ADDRESS;
-                assert!(
-                    physical >= addr_of!(__data_start) as u64
-                        && physical + PAGE_SIZE <= addr_of!(__kernel_end) as u64,
-                    "page table is outside writable kernel memory"
-                );
-                let table_mapping = permissions(physical).expect("page table is unmapped");
-                assert!(table_mapping.writable && !table_mapping.user && !table_mapping.executable);
-                for page in 0..512 {
-                    audit_leaf(base + page * PAGE_SIZE);
+            assert_ne!(entry & PRESENT, 0);
+            assert_eq!(entry & HUGE, 0);
+            let directory = crate::userspace::expected_directory(root, index)
+                .expect("unknown process page directory");
+            assert_eq!(entry & ADDRESS, directory);
+            audit_table(directory);
+            for offset in 0..512 {
+                let entry = read_volatile((directory as *const u64).add(offset));
+                if entry & PRESENT == 0 {
+                    continue;
+                }
+                let base = (index * 512 + offset) as u64 * HUGE_SIZE;
+                if entry & HUGE != 0 {
+                    audit_leaf(base);
+                    assert_eq!(entry & ADDRESS & !(HUGE_SIZE - 1), base);
+                } else {
+                    audit_table(entry & ADDRESS);
+                    for page in 0..512 {
+                        audit_leaf(base + page * PAGE_SIZE);
+                    }
                 }
             }
         }
@@ -313,6 +317,20 @@ pub fn check_permissions() {
     }
 }
 
+fn audit_table(physical: u64) {
+    assert!(
+        physical.is_multiple_of(PAGE_SIZE)
+            && physical >= addr_of!(__data_start) as u64
+            && physical + PAGE_SIZE <= addr_of!(__kernel_end) as u64,
+        "page table is outside writable kernel memory"
+    );
+    let mapping = permissions(physical).expect("page table is unmapped");
+    assert!(
+        mapping.physical == physical && mapping.writable && !mapping.user && !mapping.executable,
+        "page table is not supervisor RW/NX identity mapped"
+    );
+}
+
 fn audit_leaf(address: u64) {
     let Some(page) = permissions(address) else {
         return;
@@ -323,8 +341,14 @@ fn audit_leaf(address: u64) {
     );
     if page.user {
         assert!(
-            (0x4000_0000..0x4020_0000).contains(&address),
-            "unexpected user page"
+            crate::userspace::allowed_user_page(
+                crate::userspace::active_root(),
+                address,
+                page.physical,
+                page.writable,
+                page.executable
+            ),
+            "user page belongs to another process or unassigned device"
         );
     } else if page.executable {
         assert!(

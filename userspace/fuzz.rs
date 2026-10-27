@@ -22,8 +22,8 @@ pub fn run(seed: u64, iterations: u64) -> ! {
             u64::MAX - 7,
         ];
         let pointer = invalid[((random >> 32) % invalid.len() as u64) as usize];
-        let (number, a, b, c, expected) = match random % 22 {
-            0 => (10 + (random >> 8), 0, 0, 0, abi::ENOSYS),
+        let (number, a, b, c, expected) = match random % 24 {
+            0 => (4096 + (random >> 8), 0, 0, 0, abi::ENOSYS),
             1 => (abi::SYS_STATE, 4 + (random >> 8), 0, 0, abi::EBADF),
             2 => (abi::SYS_RECV, fd, pointer, length, abi::EFAULT),
             3 => (abi::SYS_SEND, fd, pointer, length, abi::EFAULT),
@@ -62,6 +62,7 @@ pub fn run(seed: u64, iterations: u64) -> ! {
             18 => (abi::SYS_LISTEN, fd, 80, 0, i64::MAX),
             19 => (abi::SYS_RECV, fd, address, length, i64::MAX),
             20 => (abi::SYS_SEND, fd, address, length, i64::MAX),
+            22 => (abi::SYS_FRAME_RECV + random % 9, 0, 0, 0, abi::EACCES),
             _ => (abi::SYS_NOW, 0, 0, 0, i64::MAX),
         };
         // SAFETY: invalid pointers are supplied only where the ABI must reject

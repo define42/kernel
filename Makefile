@@ -23,7 +23,7 @@ USER_TEST_BIN := build/userspace-test/kernel.bin
 TEST_ELF := target/smoke-test/$(TARGET)/release/kernel
 KERNEL_BIN := build/kernel.bin
 TEST_BIN := build/test/kernel.bin
-QEMU_COMMON := -machine pc -accel tcg -m 128M -smp 1 -no-reboot -no-shutdown
+QEMU_COMMON := -machine q35 -device intel-iommu,intremap=off -accel tcg -cpu max,-apic -m 128M -smp 1 -no-reboot -no-shutdown
 
 .PHONY: all build kernel setup run run-gui debug test test-boot test-net test-packets test-http test-userspace test-preemption test-abuse test-host fuzz fuzz-http fuzz-tcp fuzz-syscalls check clean help
 
@@ -39,6 +39,8 @@ kernel:
 	@mkdir -p build
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_BIN)
 	cp target/$(TARGET)/release/webserver.elf build/webserver.elf
+	cp target/$(TARGET)/release/netd.elf build/netd.elf
+	cp target/$(TARGET)/release/nic-driver.elf build/nic-driver.elf
 
 # Serial console in this terminal; Ctrl-a x exits QEMU.
 run: kernel
@@ -53,7 +55,7 @@ debug: kernel
 	$(QEMU) $(QEMU_COMMON) $(QEMU_NET) -kernel $(KERNEL_BIN) -display none -serial mon:stdio -S -gdb tcp:127.0.0.1:1234 $(QEMU_FLAGS)
 
 # Isolate the test feature's artifacts from the normal boot image.
-test: test-boot test-userspace test-preemption test-host test-abuse test-net test-packets test-http
+test: test-boot test-userspace test-preemption test-host test-abuse test-net test-packets test-http test-services
 
 test-boot:
 	$(CARGO) build --release --features smoke-test --target $(TARGET) --target-dir target/smoke-test
@@ -105,13 +107,17 @@ test-http: kernel
 
 check:
 	$(CARGO) fmt --all -- --check
-	rustfmt --edition 2024 --check userspace/main.rs
+	rustfmt --edition 2024 --check userspace/main.rs userspace/netd.rs userspace/driver.rs
 	$(CARGO) clippy --target $(TARGET) -- -D warnings
 	$(CARGO) clippy --features userspace-test --target $(TARGET) -- -D warnings
 	$(CARGO) clippy --features preemption-test --target $(TARGET) -- -D warnings
+	$(CARGO) clippy --features isolation-test --target $(TARGET) -- -D warnings
 	$(CARGO) clippy --features fuzz-test --target $(TARGET) -- -D warnings
 	$(CARGO) clippy --manifest-path tests/host/Cargo.toml --tests --target $(HOST_TARGET) --target-dir target/host-tests -- -D warnings
 	$(CARGO) clippy --all-features --target $(TARGET) -- -D warnings
+	$(CARGO) clippy --manifest-path userspace/services/Cargo.toml --target $(TARGET) --target-dir target/services-check -- -D warnings
+	$(CLIPPY_DRIVER) --edition=2024 --crate-name nic_driver --check-cfg 'cfg(driver_test)' --crate-type bin --target $(TARGET) --emit=metadata -Cpanic=abort userspace/driver.rs -o target/nic-driver-check.rmeta -D warnings
+	$(CLIPPY_DRIVER) --edition=2024 --crate-name nic_driver --cfg driver_test --check-cfg 'cfg(driver_test)' --crate-type bin --target $(TARGET) --emit=metadata -Cpanic=abort userspace/driver.rs -o target/nic-driver-test-check.rmeta -D warnings
 	@mkdir -p target/userspace-check
 	$(CLIPPY_DRIVER) --edition=2024 --crate-name webserver --crate-type bin --target $(TARGET) --emit=metadata -Cpanic=abort --check-cfg 'cfg(userspace_test)' userspace/main.rs -o target/userspace-check/webserver.rmeta -D warnings
 	$(CLIPPY_DRIVER) --edition=2024 --crate-name webserver --crate-type bin --target $(TARGET) --emit=metadata -Cpanic=abort --check-cfg 'cfg(userspace_test)' --cfg userspace_test userspace/main.rs -o target/userspace-check/webserver-test.rmeta -D warnings
@@ -133,8 +139,17 @@ help:
 	  'make test-boot Run the original CPU/memory boot checks' \
 	  'make test-http Test HTTP requests, errors, concurrency, and timeouts' \
 	  'make test-userspace  Test ring-3 privileges, syscalls, and fault containment' \
+	  'make test-services  Test process, IPC, DMA isolation and service recovery' \
 	  'make test-preemption  Verify networking during a busy or syscall-only user loop' \
 	  'make test-abuse Verify per-source quotas and half-open recovery' \
 	  'make fuzz      Run local HTTP, TCP, and syscall mutation campaigns' \
 	  'make check     Check Rust formatting and Clippy lints' \
 	  'make clean     Remove generated files'
+
+.PHONY: test-services
+
+test-services:
+	$(CARGO) build --release --features isolation-test --target $(TARGET) --target-dir target/isolation-test
+	@mkdir -p build/isolation-test
+	$(OBJCOPY) -O binary target/isolation-test/$(TARGET)/release/kernel build/isolation-test/kernel.bin
+	$(PYTHON) scripts/isolation_test.py "$(QEMU)" build/isolation-test/kernel.bin

@@ -18,7 +18,7 @@ def main():
     args = parser.parse_args()
     directory = args.artifacts / f"syscalls-{time.time_ns()}"
     directory.mkdir(parents=True)
-    command = [args.qemu, "-machine", "pc", "-accel", "tcg", "-cpu", "max", "-m", "128M",
+    command = [args.qemu, "-machine", "q35", "-device", "intel-iommu,intremap=off", "-accel", "tcg", "-cpu", "max,-apic", "-m", "128M",
                "-smp", "1", "-kernel", str(args.kernel), "-display", "none", "-monitor", "none",
                "-serial", "stdio", "-no-reboot", "-no-shutdown", "-device", "e1000,netdev=net0",
                "-netdev", "user,id=net0,restrict=on", "-device", "isa-debug-exit,iobase=0xf4,iosize=4"]
